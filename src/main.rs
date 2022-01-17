@@ -3,6 +3,7 @@ mod riakcs;
 
 use bytesize::ByteSize;
 use clap::{App, AppSettings, Arg, ArgMatches};
+use log::LevelFilter;
 use log::{debug, error, info, warn};
 use radosgw::RadosGW;
 use riakcs::RiakCS;
@@ -11,7 +12,10 @@ use crate::radosgw::uploader::Uploader;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .default_format()
+        .filter_level(LevelFilter::Info)
+        .init();
 
     let num_cpus = num_cpus::get();
     let clap = clap::app_from_crate!()

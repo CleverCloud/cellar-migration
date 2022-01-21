@@ -130,7 +130,7 @@ impl RiakCS {
             "GET\n\n\n{}\n/{}/{}",
             expiry.timestamp(),
             self.bucket,
-            object.get_key()
+            urlencoding::encode(&object.get_key())
         );
 
         self.sign_string(to_sign)
@@ -190,9 +190,11 @@ impl RiakCS {
                 max_keys,
                 marker
                     .take()
-                    .map(|m| format!("&marker={}", m))
+                    .map(|m| format!("&marker={}", urlencoding::encode(&m)))
                     .unwrap_or_else(String::new)
             );
+
+            trace!("Build request with uri: {}", uri);
             let mut req = hyper::Request::builder()
                 .method(Method::GET)
                 .uri(uri)
@@ -231,7 +233,7 @@ impl RiakCS {
         format!(
             "{}/{}?AWSAccessKeyId={}&Expires={}&Signature={}",
             uri,
-            object.get_key(),
+            urlencoding::encode(&object.get_key()),
             self.access_key,
             expires.timestamp(),
             urlencoding::encode(&signature)
@@ -278,7 +280,11 @@ impl RiakCS {
         object: &ObjectContents,
         with_signature: bool,
     ) -> Result<ObjectMetadataResponse> {
-        let uri = format!("{}/{}", self.get_uri(), object.get_key());
+        let uri = format!(
+            "{}/{}",
+            self.get_uri(),
+            urlencoding::encode(&object.get_key())
+        );
         let mut use_signature = with_signature;
 
         // Loop or else it will complain about "recursion in an `async fn` requires boxing"

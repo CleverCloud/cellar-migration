@@ -198,8 +198,7 @@ impl RiakCS {
             let mut req = hyper::Request::builder()
                 .method(Method::GET)
                 .uri(uri)
-                .body(Body::empty())
-                .unwrap();
+                .body(Body::empty())?;
 
             self.sign_request(&mut req);
             trace!("{:#?}", req);
@@ -246,8 +245,7 @@ impl RiakCS {
         let req = hyper::Request::builder()
             .method(Method::GET)
             .uri(url)
-            .body(Body::empty())
-            .unwrap();
+            .body(Body::empty())?;
 
         self.send_request(req).await
     }
@@ -258,8 +256,7 @@ impl RiakCS {
         let mut req = hyper::Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .body(Body::empty())
-            .unwrap();
+            .body(Body::empty())?;
 
         self.sign_request(&mut req);
 
@@ -295,8 +292,7 @@ impl RiakCS {
             let mut req = hyper::Request::builder()
                 .method(Method::HEAD)
                 .uri(uri.clone())
-                .body(Body::empty())
-                .unwrap();
+                .body(Body::empty())?;
 
             if use_signature {
                 self.sign_request(&mut req);

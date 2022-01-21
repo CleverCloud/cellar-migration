@@ -110,7 +110,7 @@ async fn migrate(params: &ArgMatches) -> anyhow::Result<()> {
             .iter()
             .find(|&robject| robject.key == Some(object.get_key()))
         {
-            object == found
+            object != found
         } else {
             true
         }

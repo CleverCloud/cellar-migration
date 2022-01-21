@@ -2,6 +2,7 @@ use std::str::FromStr;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use hyper::{Body, Response};
+use log::trace;
 use serde_derive::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq, Clone)]
@@ -21,12 +22,13 @@ impl ObjectContents {
         self.key.clone()
     }
 
+    #[allow(dead_code)]
     pub fn get_last_modified(&self) -> DateTime<Utc> {
         DateTime::from_str(&self.last_modified).expect("Should be a valid LastModified")
     }
 
     pub fn get_etag(&self) -> String {
-        self.etag.replace("\"", "")
+        self.etag.clone()
     }
 
     pub fn get_size(&self) -> u64 {
@@ -61,14 +63,11 @@ impl ListObjectResponse {
 
 impl PartialEq<rusoto_s3::Object> for ObjectContents {
     fn eq(&self, other: &rusoto_s3::Object) -> bool {
-        let other_last_modified: Option<DateTime<Utc>> = other
-            .last_modified
-            .clone()
-            .and_then(|date| DateTime::from_str(&date).ok());
+        trace!("Self: {:#?}\nOther: {:#?}", self, other);
+
         other.key == Some(self.get_key())
             && other.e_tag == Some(self.get_etag())
             && other.size == Some(self.get_size() as i64)
-            && other_last_modified == Some(self.get_last_modified())
     }
 }
 

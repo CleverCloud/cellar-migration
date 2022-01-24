@@ -1,6 +1,6 @@
 [package]
 name = "cellar-migration"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 authors = [ "Arnaud Lefebvre <arnaud.lefebvre@clever-cloud.com>" ]
 

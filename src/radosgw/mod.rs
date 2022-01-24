@@ -188,15 +188,30 @@ impl RadosGW {
     pub async fn list_objects(
         &self,
     ) -> Result<Vec<rusoto_s3::Object>, RusotoError<ListObjectsV2Error>> {
-        let list_objects_request = ListObjectsV2Request {
-            bucket: self.bucket.clone(),
-            ..Default::default()
-        };
+        let mut results = Vec::new();
 
-        let client = self.get_client();
-        client
-            .list_objects_v2(list_objects_request)
-            .await
-            .map(|res| res.contents.unwrap_or_default())
+        loop {
+            let list_objects_request = ListObjectsV2Request {
+                bucket: self.bucket.clone(),
+                start_after: results.last().map(|obj: &rusoto_s3::Object| {
+                    String::from(obj.key.as_ref().expect("Object should have a key"))
+                }),
+                ..Default::default()
+            };
+
+            let client = self.get_client();
+            let mut objects = client
+                .list_objects_v2(list_objects_request.clone())
+                .await
+                .map(|res| res.contents.unwrap_or_default())?;
+
+            if objects.is_empty() {
+                break;
+            }
+
+            results.append(&mut objects);
+        }
+
+        Ok(results)
     }
 }

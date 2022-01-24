@@ -124,6 +124,8 @@ async fn migrate(params: &ArgMatches) -> anyhow::Result<()> {
             .collect::<Vec<String>>()
     );
 
+    debug!("Objects to sync: {:#?}", riak_objects);
+
     let total_sync_bytes = riak_objects
         .iter()
         .fold(0, |acc, object| acc + object.get_size() as u64);

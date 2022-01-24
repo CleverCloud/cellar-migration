@@ -106,6 +106,22 @@ impl ObjectMetadata {
                 .to_string()
         })
     }
+
+    pub fn etag_has_parts(&self) -> bool {
+        self.etag.as_ref().and_then(|etag| etag.find('-')).is_some()
+    }
+
+    pub fn get_number_of_parts(&self) -> usize {
+        self.etag
+            .as_ref()
+            .and_then(|etag| {
+                etag.split('-')
+                    .into_iter()
+                    .last()
+                    .and_then(|etag_nbr| etag_nbr.parse::<usize>().ok())
+            })
+            .unwrap_or(0)
+    }
 }
 
 impl From<Response<Body>> for ObjectMetadata {

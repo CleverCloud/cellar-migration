@@ -19,6 +19,8 @@ use crate::riakcs::{
 
 use super::RadosGW;
 
+const ONE_MEGABYTE: f64 = (1024 * 1024) as f64;
+
 #[derive(Debug, Clone)]
 pub struct Uploader {
     riak_client: RiakCS,
@@ -121,8 +123,28 @@ impl Uploader {
         if response.status().is_success() {
             let start = std::time::Instant::now();
             let object_size = object.get_size() as usize;
+            let force_multipart_upload = object_metadata.metadata.etag_has_parts();
 
-            if object_size < multipart_chunk_size {
+            if force_multipart_upload {
+                // See https://teppen.io/2018/06/23/aws_s3_etags/ for the calcul explanation
+                let raw_part_size =
+                    object_size as f64 / object_metadata.metadata.get_number_of_parts() as f64;
+
+                let part_modulus = raw_part_size % ONE_MEGABYTE;
+                let part_size = ((raw_part_size + ONE_MEGABYTE) - part_modulus) as usize;
+
+                let body =
+                    RiakResponseStreamChunk::new(RiakResponseStream::new(response), part_size);
+                Uploader::sync_object_multipart(
+                    radosgw_client,
+                    object,
+                    &object_metadata,
+                    body,
+                    part_size,
+                    thread_id,
+                )
+                .await?;
+            } else if object_size < multipart_chunk_size {
                 let body = ByteStream::new(RiakResponseStream::new(response));
                 Uploader::sync_object_singlepart(
                     radosgw_client,

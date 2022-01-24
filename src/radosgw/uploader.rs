@@ -13,13 +13,13 @@ use rusoto_core::ByteStream;
 use tokio::task::JoinError;
 
 use crate::riakcs::{
-    dto::{ObjectContents, ObjectMetadataResponse},
+    dto::{get_part_size_from_etag, ObjectContents, ObjectMetadataResponse},
     RiakCS,
 };
 
 use super::RadosGW;
 
-const ONE_MEGABYTE: f64 = (1024 * 1024) as f64;
+pub const RADOSGW_MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
 
 #[derive(Debug, Clone)]
 pub struct Uploader {
@@ -123,16 +123,23 @@ impl Uploader {
         if response.status().is_success() {
             let start = std::time::Instant::now();
             let object_size = object.get_size() as usize;
-            let force_multipart_upload = object_metadata.metadata.etag_has_parts();
+            let force_multipart_upload = if object_metadata.metadata.etag_has_parts() {
+                let part_size = get_part_size_from_etag(
+                    object_metadata.metadata.etag.as_ref().unwrap(),
+                    object_size,
+                );
 
-            if force_multipart_upload {
-                // See https://teppen.io/2018/06/23/aws_s3_etags/ for the calcul explanation
-                let raw_part_size =
-                    object_size as f64 / object_metadata.metadata.get_number_of_parts() as f64;
+                if part_size >= RADOSGW_MIN_PART_SIZE {
+                    Some(part_size)
+                } else {
+                    warn!("Object {} has been initially uploaded using multipart upload with parts less than 5MB. A different part size will be used if needed.", object.get_key());
+                    None
+                }
+            } else {
+                None
+            };
 
-                let part_modulus = raw_part_size % ONE_MEGABYTE;
-                let part_size = ((raw_part_size + ONE_MEGABYTE) - part_modulus) as usize;
-
+            if let Some(part_size) = force_multipart_upload {
                 let body =
                     RiakResponseStreamChunk::new(RiakResponseStream::new(response), part_size);
                 Uploader::sync_object_multipart(

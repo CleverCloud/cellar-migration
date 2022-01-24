@@ -2,8 +2,12 @@ use std::str::FromStr;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use hyper::{Body, Response};
-use log::trace;
+use log::{trace, warn};
 use serde_derive::Deserialize;
+
+use crate::radosgw::uploader::RADOSGW_MIN_PART_SIZE;
+
+const ONE_MEGABYTE: f64 = (1024 * 1024) as f64;
 
 #[derive(Debug, Deserialize, PartialEq, Clone)]
 pub struct ObjectContents {
@@ -65,9 +69,31 @@ impl PartialEq<rusoto_s3::Object> for ObjectContents {
     fn eq(&self, other: &rusoto_s3::Object) -> bool {
         trace!("Self: {:#?}\nOther: {:#?}", self, other);
 
-        other.key == Some(self.get_key())
-            && other.e_tag == Some(self.get_etag())
-            && other.size == Some(self.get_size() as i64)
+        if other.key == Some(self.get_key()) && other.size == Some(self.get_size() as i64) {
+            if other.e_tag == Some(self.get_etag()) {
+                true
+            } else if self.get_etag().contains('-') {
+                let part_size = get_part_size_from_etag(&self.get_etag(), self.get_size() as usize);
+                if part_size < RADOSGW_MIN_PART_SIZE {
+                    warn!("Object {} has been uploaded using multipart upload with a part size less than 5MB. Falling back to last modification date to compare objects.", self.get_key());
+                    let other_date: Option<DateTime<Utc>> = other
+                        .last_modified
+                        .as_ref()
+                        .and_then(|date| DateTime::from_str(date).ok());
+                    if let Some(other_date) = other_date {
+                        self.get_last_modified() < other_date
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
 }
 
@@ -110,18 +136,6 @@ impl ObjectMetadata {
     pub fn etag_has_parts(&self) -> bool {
         self.etag.as_ref().and_then(|etag| etag.find('-')).is_some()
     }
-
-    pub fn get_number_of_parts(&self) -> usize {
-        self.etag
-            .as_ref()
-            .and_then(|etag| {
-                etag.split('-')
-                    .into_iter()
-                    .last()
-                    .and_then(|etag_nbr| etag_nbr.parse::<usize>().ok())
-            })
-            .unwrap_or(0)
-    }
 }
 
 impl From<Response<Body>> for ObjectMetadata {
@@ -150,4 +164,20 @@ impl From<Response<Body>> for ObjectMetadata {
             expires: Self::extract_header(&response, "expires"),
         }
     }
+}
+
+pub fn get_part_size_from_etag(etag: &str, object_size: usize) -> usize {
+    // See https://teppen.io/2018/06/23/aws_s3_etags/ for the calcul explanation
+    let etag_parts = etag
+        .replace("\"", "")
+        .split('-')
+        .into_iter()
+        .last()
+        .and_then(|etag_nbr| etag_nbr.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("ETag should contain a part that's a usize, got {}", etag));
+
+    let raw_part_size = object_size as f64 / etag_parts as f64;
+
+    let part_modulus = raw_part_size % ONE_MEGABYTE;
+    ((raw_part_size + ONE_MEGABYTE) - part_modulus) as usize
 }

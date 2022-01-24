@@ -11,7 +11,7 @@ You can download pre-built binaries in the [Releases section](https://github.com
 If your platform isn't supported or you prefer to compile it yourself, you can install [Rust](https://www.rust-lang.org/) and run as your regular user:
 
 ```
-cargo install --git https://github.com/CleverCloud/cellar-c1-migration-tool --tag v1.0.3
+cargo install --git https://github.com/CleverCloud/cellar-c1-migration-tool --tag v1.0.4
 ```
 
 It should then install the binary in `$HOME/.cargo/bin`.

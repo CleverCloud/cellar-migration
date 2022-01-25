@@ -55,7 +55,7 @@ impl Uploader {
         }
     }
 
-    pub async fn sync(&mut self) -> Vec<Result<Vec<anyhow::Result<()>>, JoinError>> {
+    pub async fn sync(&mut self) -> Vec<Result<Vec<anyhow::Result<ObjectContents>>, JoinError>> {
         info!("Starting {} sync threads", self.threads);
         let mut handles = Vec::new();
         let total_files = self.objects.clone().lock().unwrap().len();
@@ -91,7 +91,9 @@ impl Uploader {
                             thread_id,
                             multipart_chunk_size,
                         )
-                        .await;
+                        .await
+                        .map(|_| object);
+
                         results.push(result);
                     } else {
                         info!(

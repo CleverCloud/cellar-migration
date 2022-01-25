@@ -1,14 +1,14 @@
+mod migrate;
 mod radosgw;
 mod riakcs;
 
 use bytesize::ByteSize;
 use clap::{App, AppSettings, Arg, ArgMatches};
 use log::LevelFilter;
-use log::{debug, error, info, warn};
-use radosgw::RadosGW;
-use riakcs::RiakCS;
+use log::{error, info, warn};
+use migrate::BucketMigrationConfiguration;
 
-use crate::radosgw::uploader::Uploader;
+use crate::migrate::BucketMigrationError;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -55,12 +55,12 @@ async fn main() -> anyhow::Result<()> {
         .get_matches();
 
     match clap.subcommand() {
-        Some(("migrate", migrate_matches)) => migrate(migrate_matches).await,
+        Some(("migrate", migrate_matches)) => migrate_command(migrate_matches).await,
         e => unreachable!("Failed to parse subcommand: {:#?}", e),
     }
 }
 
-async fn migrate(params: &ArgMatches) -> anyhow::Result<()> {
+async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
     let dry_run = params.occurrences_of("execute") == 0;
 
     if dry_run {
@@ -79,108 +79,54 @@ async fn migrate(params: &ArgMatches) -> anyhow::Result<()> {
         .value_of_t::<usize>("max-keys")
         .expect("max-keys should be a usize");
     let sync_start = std::time::Instant::now();
-    let riak_client = RiakCS::new(
-        "cellar.services.clever-cloud.com".to_string(),
-        params.value_of("source-access-key").unwrap().to_string(),
-        params.value_of("source-secret-key").unwrap().to_string(),
-        params.value_of("source-bucket").unwrap().to_string(),
-    );
 
-    let radosgw_client = RadosGW::new(
-        params.value_of("destination-endpoint").unwrap().to_string(),
-        params
+    let bucket_migration = BucketMigrationConfiguration {
+        source_bucket: params.value_of("source-bucket").unwrap().to_string(),
+        source_access_key: params.value_of("source-access-key").unwrap().to_string(),
+        source_secret_key: params.value_of("source-secret-key").unwrap().to_string(),
+        source_endpoint: "cellar.services.clever-cloud.com".to_string(),
+        destination_bucket: params.value_of("destination-bucket").unwrap().to_string(),
+        destination_access_key: params
             .value_of("destination-access-key")
             .unwrap()
             .to_string(),
-        params
+        destination_secret_key: params
             .value_of("destination-secret-key")
             .unwrap()
             .to_string(),
-        params.value_of("destination-bucket").unwrap().to_string(),
-    );
+        destination_endpoint: params.value_of("destination-endpoint").unwrap().to_string(),
+        max_keys,
+        chunk_size: multipart_upload_chunk_size,
+        sync_threads,
+        dry_run,
+    };
 
-    let mut riak_objects = riak_client.list_objects(max_keys).await?;
-    let radosgw_objects = radosgw_client.list_objects().await?;
+    let migration_result = migrate::migrate_bucket(bucket_migration).await;
+    let stats = match &migration_result {
+        Ok(stats) => Some(stats),
+        Err(error) => error
+            .downcast_ref::<BucketMigrationError>()
+            .map(|error| &error.stats),
+    };
 
-    debug!("Riakcs objects: {}", riak_objects.len());
-    debug!("Radosgw objects: {}", radosgw_objects.len());
-
-    riak_objects.retain(|object| {
-        if let Some(found) = radosgw_objects
-            .iter()
-            .find(|&robject| robject.key == Some(object.get_key()))
-        {
-            object != found
-        } else {
-            true
-        }
-    });
-
-    info!(
-        "Those objects need to be sync: {:#?}",
-        riak_objects
-            .iter()
-            .map(|object| { format!("{} - {}", object.get_key(), ByteSize(object.get_size())) })
-            .collect::<Vec<String>>()
-    );
-
-    debug!("Objects to sync: {:#?}", riak_objects);
-
-    let total_sync_bytes = riak_objects
-        .iter()
-        .fold(0, |acc, object| acc + object.get_size() as u64);
-    info!(
-        "Total files to sync: {} for a total of {}",
-        riak_objects.len(),
-        ByteSize(total_sync_bytes)
-    );
-
-    if !dry_run {
-        if !riak_objects.is_empty() {
-            let mut uploader = Uploader::new(
-                riak_client,
-                radosgw_client,
-                riak_objects,
-                sync_threads,
-                multipart_upload_chunk_size,
-            );
-            let results = uploader.sync().await;
-            let results_errors: Vec<&Result<(), anyhow::Error>> = results
-                .iter()
-                .flat_map(|join_result| {
-                    join_result
-                        .as_ref()
-                        .unwrap()
-                        .iter()
-                        .filter(|&result| result.is_err())
-                        .collect::<Vec<&Result<(), anyhow::Error>>>()
-                })
-                .collect();
-
-            if !results_errors.is_empty() {
-                error!("Synchronize failed for {} files", results_errors.len());
-                for result in &results_errors {
-                    error!("Error synchronizing file: {:?}", result);
-                }
-
-                return Err(anyhow::Error::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to synchronize {} files", results_errors.len()).as_str(),
-                )));
+    if let Err(error) = &migration_result {
+        if let Some(err) = error.downcast_ref::<BucketMigrationError>() {
+            for f in &err.errors {
+                error!("{}", f);
             }
         } else {
-            warn!("No files to synchronize");
+            error!("Error during synchronization: {:#?}", error);
         }
-        let elapsed = sync_start.elapsed();
-        info!(
-            "Sync took {:?} for {} ({}/s)",
-            elapsed,
-            ByteSize(total_sync_bytes),
-            ByteSize((total_sync_bytes as f64 / elapsed.as_secs_f64()) as u64)
-        );
-    } else {
-        info!("Dry run took {:?}", sync_start.elapsed());
     }
+
+    let elapsed = sync_start.elapsed();
+    let synchronization_size = stats.as_ref().map(|s| s.synchronization_size).unwrap_or(0);
+    info!(
+        "Sync took {:?} for {} ({}/s)",
+        elapsed,
+        ByteSize(synchronization_size as u64),
+        ByteSize((synchronization_size as f64 / elapsed.as_secs_f64()) as u64)
+    );
 
     Ok(())
 }

@@ -45,7 +45,7 @@ pub struct ListObjectResponse {
     #[serde(rename(deserialize = "Name"))]
     name: String,
     #[serde(rename(deserialize = "Contents"))]
-    contents: Vec<ObjectContents>,
+    contents: Option<Vec<ObjectContents>>,
     #[serde(rename(deserialize = "IsTruncated"))]
     truncated: bool,
 }
@@ -57,7 +57,7 @@ impl ListObjectResponse {
     }
 
     pub fn get_objects(&self) -> Vec<ObjectContents> {
-        self.contents.clone()
+        self.contents.clone().unwrap_or_default()
     }
 
     pub fn truncated(&self) -> bool {

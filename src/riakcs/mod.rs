@@ -10,7 +10,9 @@ use log::trace;
 use ring::hmac;
 use serde::Deserialize;
 
-use self::dto::{ObjectMetadata, ObjectMetadataResponse};
+use crate::riakcs::dto::ListBucketsResult;
+
+use self::dto::{ListBucket, ObjectMetadata, ObjectMetadataResponse};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -51,11 +53,16 @@ pub struct RiakCS {
     endpoint: String,
     access_key: String,
     secret_key: String,
-    bucket: String,
+    bucket: Option<String>,
 }
 
 impl RiakCS {
-    pub fn new(endpoint: String, access_key: String, secret_key: String, bucket: String) -> RiakCS {
+    pub fn new(
+        endpoint: String,
+        access_key: String,
+        secret_key: String,
+        bucket: Option<String>,
+    ) -> RiakCS {
         RiakCS {
             endpoint,
             access_key,
@@ -129,7 +136,7 @@ impl RiakCS {
         let to_sign = format!(
             "GET\n\n\n{}\n/{}/{}",
             expiry.timestamp(),
-            self.bucket,
+            self.bucket.as_ref().unwrap_or(&String::new()),
             urlencoding::encode(&object.get_key())
         );
 
@@ -137,7 +144,11 @@ impl RiakCS {
     }
 
     fn get_uri(&self) -> String {
-        format!("https://{}/{}", self.endpoint, self.bucket)
+        format!(
+            "https://{}/{}",
+            self.endpoint,
+            self.bucket.as_ref().unwrap_or(&String::new())
+        )
     }
 
     async fn send_request_deser<'de, T>(&self, req: hyper::Request<Body>) -> Result<T>
@@ -322,5 +333,18 @@ impl RiakCS {
         object: &ObjectContents,
     ) -> Result<ObjectMetadataResponse> {
         self._get_object_metadata(object, false).await
+    }
+
+    pub async fn list_buckets(&self) -> Result<Vec<ListBucket>> {
+        let uri = self.get_uri();
+        let mut req = hyper::Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())?;
+
+        self.sign_request(&mut req);
+        let response: ListBucketsResult = self.send_request_deser(req).await?;
+
+        Ok(response.get_buckets().to_vec())
     }
 }

@@ -3,12 +3,12 @@ pub mod uploader;
 
 use rusoto_core::{ByteStream, RusotoError};
 use rusoto_s3::{
-    AbortMultipartUploadError, AbortMultipartUploadOutput, AbortMultipartUploadRequest,
+    AbortMultipartUploadError, AbortMultipartUploadOutput, AbortMultipartUploadRequest, Bucket,
     CompleteMultipartUploadError, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
-    CompletedMultipartUpload, CompletedPart, CreateMultipartUploadError,
-    CreateMultipartUploadOutput, CreateMultipartUploadRequest, ListObjectsV2Error,
-    ListObjectsV2Request, PutObjectError, PutObjectOutput, PutObjectRequest, S3Client,
-    UploadPartError, UploadPartOutput, UploadPartRequest, S3,
+    CompletedMultipartUpload, CompletedPart, CreateBucketError, CreateBucketRequest,
+    CreateMultipartUploadError, CreateMultipartUploadOutput, CreateMultipartUploadRequest,
+    ListBucketsError, ListObjectsV2Error, ListObjectsV2Request, PutObjectError, PutObjectOutput,
+    PutObjectRequest, S3Client, UploadPartError, UploadPartOutput, UploadPartRequest, S3,
 };
 
 use crate::riakcs::dto::ObjectMetadataResponse;
@@ -18,7 +18,7 @@ pub struct RadosGW {
     endpoint: String,
     access_key: String,
     secret_key: String,
-    bucket: String,
+    bucket: Option<String>,
 }
 
 impl RadosGW {
@@ -26,7 +26,7 @@ impl RadosGW {
         endpoint: String,
         access_key: String,
         secret_key: String,
-        bucket: String,
+        bucket: Option<String>,
     ) -> RadosGW {
         RadosGW {
             endpoint,
@@ -63,7 +63,10 @@ impl RadosGW {
         let put_object_request = PutObjectRequest {
             body: Some(body),
             key,
-            bucket: self.bucket.clone(),
+            bucket: self
+                .bucket
+                .clone()
+                .expect("put_object should have a bucket"),
             content_length: Some(size),
             acl: if object_metadata.acl_public {
                 Some("public-read".to_string())
@@ -91,7 +94,10 @@ impl RadosGW {
     ) -> Result<CreateMultipartUploadOutput, RusotoError<CreateMultipartUploadError>> {
         let multipart_upload_request = CreateMultipartUploadRequest {
             key,
-            bucket: self.bucket.clone(),
+            bucket: self
+                .bucket
+                .clone()
+                .expect("create_multipart_upload should have a bucket"),
             acl: if object_metadata.acl_public {
                 Some("public-read".to_string())
             } else {
@@ -123,7 +129,10 @@ impl RadosGW {
     ) -> Result<UploadPartOutput, RusotoError<UploadPartError>> {
         let part_upload_request = UploadPartRequest {
             key,
-            bucket: self.bucket.clone(),
+            bucket: self
+                .bucket
+                .clone()
+                .expect("put_object_part should have a bucket"),
             body: Some(body),
             upload_id,
             part_number,
@@ -155,7 +164,10 @@ impl RadosGW {
 
         let complete_multipart_upload_request = CompleteMultipartUploadRequest {
             key,
-            bucket: self.bucket.clone(),
+            bucket: self
+                .bucket
+                .clone()
+                .expect("complete_multipart_upload should have a bucket"),
             multipart_upload: Some(completed_multipart_upload_parts),
             upload_id,
             ..Default::default()
@@ -174,7 +186,10 @@ impl RadosGW {
     ) -> Result<AbortMultipartUploadOutput, RusotoError<AbortMultipartUploadError>> {
         let abort_multipart_upload_request = AbortMultipartUploadRequest {
             key,
-            bucket: self.bucket.clone(),
+            bucket: self
+                .bucket
+                .clone()
+                .expect("abort_multipart_upload should have a bucket"),
             upload_id,
             ..Default::default()
         };
@@ -192,7 +207,10 @@ impl RadosGW {
 
         loop {
             let list_objects_request = ListObjectsV2Request {
-                bucket: self.bucket.clone(),
+                bucket: self
+                    .bucket
+                    .clone()
+                    .expect("list_objects should have a bucket"),
                 start_after: results.last().map(|obj: &rusoto_s3::Object| {
                     String::from(obj.key.as_ref().expect("Object should have a key"))
                 }),
@@ -213,5 +231,31 @@ impl RadosGW {
         }
 
         Ok(results)
+    }
+
+    pub async fn list_buckets(&self) -> Result<Vec<Bucket>, RusotoError<ListBucketsError>> {
+        let client = self.get_client();
+        client
+            .list_buckets()
+            .await
+            .map(|result| result.buckets.unwrap_or_default())
+    }
+
+    pub async fn create_bucket(
+        &self,
+        bucket: String,
+    ) -> Result<(), RusotoError<CreateBucketError>> {
+        let client = self.get_client();
+        // TODO: check if original bucket is public and if it is, apply the same ACL here
+        // There might also be some policies, we need to create them.
+        let create_bucket_request = CreateBucketRequest {
+            bucket,
+            ..Default::default()
+        };
+
+        client
+            .create_bucket(create_bucket_request)
+            .await
+            .map(|_| ())
     }
 }

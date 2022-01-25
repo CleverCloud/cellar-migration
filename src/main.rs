@@ -5,10 +5,12 @@ mod riakcs;
 use bytesize::ByteSize;
 use clap::{App, AppSettings, Arg, ArgMatches};
 use log::LevelFilter;
-use log::{error, info, warn};
+use log::{debug, error, info, trace, warn};
 use migrate::BucketMigrationConfiguration;
 
-use crate::migrate::BucketMigrationError;
+use crate::migrate::{BucketMigrationError, BucketMigrationStats};
+use crate::riakcs::dto::ObjectContents;
+use crate::riakcs::RiakCS;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,10 +25,11 @@ async fn main() -> anyhow::Result<()> {
         .subcommand(
             App::new("migrate")
             .about("Migrate a cellar-c1 bucket to a cellar-c2 cluster. By default, it will dry run unless --execute is passed")
-            .arg(Arg::new("source-bucket").long("source-bucket").help("Source bucket from which files will be copied").required(true).takes_value(true))
+            .arg(Arg::new("source-bucket").long("source-bucket").help("Source bucket from which files will be copied. If omitted, all buckets of the add-on will be synchronized").takes_value(true))
             .arg(Arg::new("source-access-key").long("source-access-key").help("Source bucket Cellar access key").required(true).takes_value(true))
             .arg(Arg::new("source-secret-key").long("source-secret-key").help("Source bucket Cellar secret key").required(true).takes_value(true))
-            .arg(Arg::new("destination-bucket").long("destination-bucket").help("Destination bucket to which the files will be copied").required(true).takes_value(true))
+            .arg(Arg::new("destination-bucket").long("destination-bucket").help("Destination bucket to which the files will be copied. If omitted, the bucket will be created if it doesn't exist").takes_value(true))
+            .arg(Arg::new("destination-bucket-prefix").long("destination-bucket-prefix").help("Prefix to apply to the destination bucket name").takes_value(true))
             .arg(Arg::new("destination-access-key").long("destination-access-key").help("Destination bucket Cellar access key").required(true).takes_value(true))
             .arg(Arg::new("destination-secret-key").long("destination-secret-key").help("Destination bucket Cellar secret key").required(true).takes_value(true))
             .arg(Arg::new("destination-endpoint").long("destination-endpoint").help("Destination endpoint of the Cellar cluster. Defaults to Paris Cellar cluster")
@@ -78,49 +81,220 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
     let max_keys = params
         .value_of_t::<usize>("max-keys")
         .expect("max-keys should be a usize");
+
+    let source_bucket = params.value_of("source-bucket").map(|b| b.to_string());
+    let source_access_key = params.value_of("source-access-key").unwrap().to_string();
+    let source_secret_key = params.value_of("source-secret-key").unwrap().to_string();
+    let source_endpoint = "cellar.services.clever-cloud.com".to_string();
+
+    let destination_bucket = params.value_of("destination-bucket").map(|b| b.to_string());
+    let destination_bucket_prefix = params
+        .value_of("destination-bucket-prefix")
+        .map(|b| format!("{}-", b))
+        .unwrap_or_default();
+    let destination_access_key = params
+        .value_of("destination-access-key")
+        .unwrap()
+        .to_string();
+    let destination_secret_key = params
+        .value_of("destination-secret-key")
+        .unwrap()
+        .to_string();
+    let destination_endpoint = params.value_of("destination-endpoint").unwrap().to_string();
+
+    if source_bucket.is_none() && destination_bucket.is_some() {
+        error!("You can't give a destination bucket without a source bucket. Please specify the --source-bucket option");
+        std::process::exit(1);
+    }
+
     let sync_start = std::time::Instant::now();
 
-    let bucket_migration = BucketMigrationConfiguration {
-        source_bucket: params.value_of("source-bucket").unwrap().to_string(),
-        source_access_key: params.value_of("source-access-key").unwrap().to_string(),
-        source_secret_key: params.value_of("source-secret-key").unwrap().to_string(),
-        source_endpoint: "cellar.services.clever-cloud.com".to_string(),
-        destination_bucket: params.value_of("destination-bucket").unwrap().to_string(),
-        destination_access_key: params
-            .value_of("destination-access-key")
-            .unwrap()
-            .to_string(),
-        destination_secret_key: params
-            .value_of("destination-secret-key")
-            .unwrap()
-            .to_string(),
-        destination_endpoint: params.value_of("destination-endpoint").unwrap().to_string(),
-        max_keys,
-        chunk_size: multipart_upload_chunk_size,
-        sync_threads,
+    let buckets_to_migrate = if let Some(bucket) = source_bucket.as_ref() {
+        info!("Only bucket {} will be migrated", bucket);
+        vec![bucket.clone()]
+    } else {
+        info!("All buckets of this Cellar add-ons will be migrated");
+        let riak_client = RiakCS::new(
+            source_endpoint.clone(),
+            source_access_key.clone(),
+            source_secret_key.clone(),
+            None,
+        );
+
+        let riak_buckets = riak_client.list_buckets().await?;
+        riak_buckets
+            .iter()
+            .map(|bucket| bucket.name.clone())
+            .collect()
+    };
+
+    // First make sure the destination buckets exist / can be created
+    // If not, exit now
+    if migrate::create_destination_buckets(
+        destination_endpoint.clone(),
+        destination_access_key.clone(),
+        destination_secret_key.clone(),
+        destination_bucket.clone(),
+        destination_bucket_prefix.clone(),
+        &buckets_to_migrate,
         dry_run,
-    };
+    )
+    .await
+    .is_err()
+    {
+        error!("Error while creating destination buckets. Aborting now.");
+        std::process::exit(1);
+    }
 
-    let migration_result = migrate::migrate_bucket(bucket_migration).await;
-    let stats = match &migration_result {
-        Ok(stats) => Some(stats),
-        Err(error) => error
-            .downcast_ref::<BucketMigrationError>()
-            .map(|error| &error.stats),
-    };
+    let mut migration_results = Vec::with_capacity(buckets_to_migrate.len());
 
-    if let Err(error) = &migration_result {
-        if let Some(err) = error.downcast_ref::<BucketMigrationError>() {
-            for f in &err.errors {
-                error!("{}", f);
+    for bucket in &buckets_to_migrate {
+        if dry_run {
+            info!(
+                "DRY-RUN | Bucket {} | Starting listing of files that need to be synchronized",
+                bucket
+            );
+        } else {
+            info!("Bucket {} | Starting migration of bucket", bucket);
+        }
+
+        let destination_bucket = if source_bucket.is_some() {
+            if buckets_to_migrate.len() == 1 {
+                destination_bucket.as_ref().unwrap_or(bucket)
+            } else {
+                panic!(
+                    "We can't have a source bucket specified but with multiple buckets to migrate"
+                );
             }
         } else {
-            error!("Error during synchronization: {:#?}", error);
+            bucket
+        };
+
+        debug!(
+            "Bucket {} | Starting synchronization of bucket with destination bucket {}",
+            bucket, destination_bucket
+        );
+
+        let bucket_migration = BucketMigrationConfiguration {
+            source_bucket: bucket.clone(),
+            source_access_key: source_access_key.clone(),
+            source_secret_key: source_secret_key.clone(),
+            source_endpoint: source_endpoint.clone(),
+            destination_bucket: format!("{}{}", destination_bucket_prefix, destination_bucket),
+            destination_access_key: destination_access_key.clone(),
+            destination_secret_key: destination_secret_key.clone(),
+            destination_endpoint: destination_endpoint.clone(),
+            max_keys,
+            chunk_size: multipart_upload_chunk_size,
+            sync_threads,
+            dry_run,
+        };
+
+        trace!(
+            "Bucket {} | Bucket Migration Configuration: {:#?}",
+            bucket,
+            bucket_migration
+        );
+
+        let migration_result = migrate::migrate_bucket(bucket_migration).await;
+
+        debug!(
+            "Bucket {} | Migration result: {:#?}",
+            bucket, migration_result
+        );
+
+        if !dry_run {
+            info!("Bucket {} | Bucket has been synchronized", bucket);
         }
+
+        migration_results.push(migration_result);
+    }
+
+    if dry_run {
+        let all_stats = migration_results
+            .iter()
+            .map(|result| match result {
+                Ok(stats) => Some(stats),
+                Err(error) => error
+                    .downcast_ref::<BucketMigrationError>()
+                    .map(|err| &err.stats),
+            })
+            .flatten()
+            .collect::<Vec<&BucketMigrationStats>>();
+
+        let all_objects = all_stats
+            .iter()
+            .map(|stat| &stat.objects)
+            .flatten()
+            .collect::<Vec<&ObjectContents>>();
+
+        info!(
+            "Those objects need to be sync: {:#?}",
+            all_stats
+                .iter()
+                .map(|stats| {
+                    stats.objects.iter().map(|object| {
+                        format!(
+                            "{}/{} - {}",
+                            stats.bucket,
+                            object.get_key(),
+                            ByteSize(object.get_size())
+                        )
+                    })
+                })
+                .flatten()
+                .collect::<Vec<String>>()
+        );
+
+        debug!("Objects to sync: {:#?}", all_objects);
+
+        let total_sync_bytes = all_objects
+            .iter()
+            .fold(0, |acc, object| acc + object.get_size() as u64);
+
+        info!(
+            "Total files to sync: {} for a total of {}",
+            all_objects.len(),
+            ByteSize(total_sync_bytes)
+        );
     }
 
     let elapsed = sync_start.elapsed();
-    let synchronization_size = stats.as_ref().map(|s| s.synchronization_size).unwrap_or(0);
+
+    for (index, migration_result) in migration_results.iter().enumerate() {
+        let bucket = buckets_to_migrate
+            .get(index)
+            .expect("Bucket should be at index");
+
+        if let Err(error) = migration_result {
+            if let Some(err) = error.downcast_ref::<BucketMigrationError>() {
+                for f in &err.errors {
+                    error!("Bucket {} | {}", bucket, f);
+                }
+            } else {
+                error!(
+                    "Bucket {} | Error during synchronization: {:#?}",
+                    bucket, error
+                );
+            }
+        }
+    }
+
+    let synchronization_size = migration_results.iter().fold(0, |acc, migration_result| {
+        let stats = match migration_result {
+            Ok(stats) => Some(stats),
+            Err(error) => error
+                .downcast_ref::<BucketMigrationError>()
+                .map(|error| &error.stats),
+        };
+
+        if let Some(bucket_stats) = stats {
+            acc + bucket_stats.synchronization_size
+        } else {
+            acc
+        }
+    });
+
     info!(
         "Sync took {:?} for {} ({}/s)",
         elapsed,

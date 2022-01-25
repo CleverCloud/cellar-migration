@@ -1,7 +1,8 @@
 use std::error;
 
-use bytesize::ByteSize;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
+use rusoto_core::RusotoError;
+use rusoto_s3::{CreateBucketError, ListObjectsV2Error};
 use std::time::Duration;
 
 use crate::{
@@ -11,13 +12,14 @@ use crate::{
 
 #[derive(Debug)]
 pub struct BucketMigrationStats {
+    pub bucket: String,
     pub synchronization_time: Duration,
     pub synchronization_size: usize,
+    pub objects: Vec<ObjectContents>,
 }
 
 #[derive(Debug)]
 pub struct BucketMigrationError {
-    pub bucket: String,
     pub errors: Vec<String>,
     pub stats: BucketMigrationStats,
 }
@@ -59,18 +61,31 @@ pub async fn migrate_bucket(
         conf.source_endpoint,
         conf.source_access_key,
         conf.source_secret_key,
-        conf.source_bucket.clone(),
+        Some(conf.source_bucket.clone()),
     );
 
     let radosgw_client = RadosGW::new(
         conf.destination_endpoint,
         conf.destination_access_key,
         conf.destination_secret_key,
-        conf.destination_bucket,
+        Some(conf.destination_bucket),
     );
 
+    debug!("riak client: {:#?}", riak_client);
+    debug!("radosgw_client: {:#?}", radosgw_client);
+
     let mut riak_objects = riak_client.list_objects(conf.max_keys).await?;
-    let radosgw_objects = radosgw_client.list_objects().await?;
+    let radosgw_objects = match radosgw_client.list_objects().await {
+        Ok(objects) => objects,
+        Err(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
+            if conf.dry_run {
+                Vec::new()
+            } else {
+                panic!("Unexpected error: Destination bucket doesn't exist but we tried to list its files");
+            }
+        }
+        Err(e) => return Err(anyhow::Error::from(e)),
+    };
 
     debug!("Riakcs objects: {}", riak_objects.len());
     debug!("Radosgw objects: {}", radosgw_objects.len());
@@ -86,32 +101,12 @@ pub async fn migrate_bucket(
         }
     });
 
-    info!(
-        "Those objects need to be sync: {:#?}",
-        riak_objects
-            .iter()
-            .map(|object| { format!("{} - {}", object.get_key(), ByteSize(object.get_size())) })
-            .collect::<Vec<String>>()
-    );
-
-    debug!("Objects to sync: {:#?}", riak_objects);
-
-    let total_sync_bytes = riak_objects
-        .iter()
-        .fold(0, |acc, object| acc + object.get_size() as u64);
-    info!(
-        "{} | Total files to sync: {} for a total of {}",
-        conf.source_bucket,
-        riak_objects.len(),
-        ByteSize(total_sync_bytes)
-    );
-
     if !conf.dry_run {
         if !riak_objects.is_empty() {
             let mut uploader = Uploader::new(
                 riak_client,
                 radosgw_client,
-                riak_objects,
+                riak_objects.clone(),
                 conf.sync_threads,
                 conf.chunk_size,
             );
@@ -130,6 +125,7 @@ pub async fn migrate_bucket(
 
             if !results_errors.is_empty() {
                 let stats = BucketMigrationStats {
+                    bucket: conf.source_bucket.clone(),
                     synchronization_time: sync_start.elapsed(),
                     synchronization_size: results
                         .iter()
@@ -143,10 +139,10 @@ pub async fn migrate_bucket(
                                 .collect::<Vec<&ObjectContents>>()
                         })
                         .fold(0, |acc, object| acc + object.get_size() as usize),
+                    objects: riak_objects,
                 };
 
                 Err(anyhow::Error::new(BucketMigrationError {
-                    bucket: conf.source_bucket.clone(),
                     errors: results_errors
                         .iter()
                         .map(|e| {
@@ -157,21 +153,118 @@ pub async fn migrate_bucket(
                 }))
             } else {
                 Ok(BucketMigrationStats {
+                    bucket: conf.source_bucket.clone(),
                     synchronization_time: sync_start.elapsed(),
-                    synchronization_size: total_sync_bytes as usize,
+                    synchronization_size: riak_objects
+                        .iter()
+                        .fold(0, |acc, obj| acc + obj.get_size() as usize),
+                    objects: riak_objects,
                 })
             }
         } else {
             warn!("{} | No files to synchronize", conf.source_bucket);
             Ok(BucketMigrationStats {
+                bucket: conf.source_bucket.clone(),
                 synchronization_time: sync_start.elapsed(),
                 synchronization_size: 0,
+                objects: riak_objects,
             })
         }
     } else {
         Ok(BucketMigrationStats {
+            bucket: conf.source_bucket.clone(),
             synchronization_time: sync_start.elapsed(),
             synchronization_size: 0,
+            objects: riak_objects,
         })
     }
+}
+
+pub async fn create_destination_buckets(
+    destination_endpoint: String,
+    destination_access_key: String,
+    destination_secret_key: String,
+    destination_bucket: Option<String>,
+    destination_bucket_prefix: String,
+    buckets: &[String],
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let client = RadosGW::new(
+        destination_endpoint.clone(),
+        destination_access_key.clone(),
+        destination_secret_key.clone(),
+        None,
+    );
+    let missing_buckets = {
+        let radosgw_buckets = client.list_buckets().await?;
+
+        buckets
+            .iter()
+            .filter(|riakcs_bucket| {
+                !radosgw_buckets.iter().any(|radosgw_bucket| -> bool {
+                    let radosgw_bucket_name = format!(
+                        "{}{}",
+                        destination_bucket_prefix,
+                        radosgw_bucket
+                            .name
+                            .as_ref()
+                            .expect("RadosGW bucket should have a name")
+                    );
+                    **riakcs_bucket == radosgw_bucket_name
+                })
+            })
+            .collect::<Vec<&String>>()
+    };
+
+    for bucket in missing_buckets {
+        let destination_bucket = if let Some(destination_bucket) = &destination_bucket {
+            format!("{}{}", destination_bucket_prefix, destination_bucket)
+        } else {
+            format!("{}{}", destination_bucket_prefix, bucket)
+        };
+
+        if dry_run {
+            // To know if the bucket already exists on another add-on, we can try to list its files. If it's not created, we will receive a NoSuchBucket error
+            // If it is, we will receive another error
+            let client_dry_run = RadosGW::new(
+                destination_endpoint.clone(),
+                destination_access_key.clone(),
+                destination_secret_key.clone(),
+                Some(destination_bucket.clone()),
+            );
+
+            match client_dry_run.list_objects().await {
+                Ok(_) | Err(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
+                    info!("DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
+                }
+                Err(e) => {
+                    bucket_already_created(&destination_bucket);
+                    return Err(anyhow::Error::from(e));
+                }
+            }
+        } else {
+            info!(
+                "Bucket {} | Bucket is missing on the destination add-on. I will try to create it",
+                bucket
+            );
+
+            match client.create_bucket(destination_bucket.clone()).await {
+                Ok(_)
+                | Err(RusotoError::Service(CreateBucketError::BucketAlreadyOwnedByYou(_))) => {
+                    info!("Bucket {} | Bucket created", destination_bucket)
+                }
+                Err(e) => {
+                    bucket_already_created(&destination_bucket);
+                    return Err(anyhow::Error::from(e));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn bucket_already_created(bucket: &str) {
+    error!("Bucket {} | Bucket can't be created because it probably has been created in another Cellar add-on, maybe by another user.", bucket);
+    error!("Please refer to https://github.com/CleverCloud/cellar-c1-migration-tool/#my-bucket-already-exists-on-the-destination-cluster to find a workaround");
 }

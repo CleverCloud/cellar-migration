@@ -166,6 +166,30 @@ impl From<Response<Body>> for ObjectMetadata {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct ListBucket {
+    #[serde(rename(deserialize = "Name"))]
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListBuckets {
+    #[serde(rename(deserialize = "Bucket"))]
+    pub bucket: Vec<ListBucket>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListBucketsResult {
+    #[serde(rename(deserialize = "Buckets"))]
+    pub buckets: ListBuckets,
+}
+
+impl ListBucketsResult {
+    pub fn get_buckets(&self) -> &Vec<ListBucket> {
+        &self.buckets.bucket
+    }
+}
+
 pub fn get_part_size_from_etag(etag: &str, object_size: usize) -> usize {
     // See https://teppen.io/2018/06/23/aws_s3_etags/ for the calcul explanation
     let etag_parts = etag

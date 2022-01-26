@@ -175,7 +175,7 @@ pub struct ListBucket {
 #[derive(Debug, Deserialize)]
 pub struct ListBuckets {
     #[serde(rename(deserialize = "Bucket"))]
-    pub bucket: Vec<ListBucket>,
+    pub bucket: Option<Vec<ListBucket>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,8 +185,8 @@ pub struct ListBucketsResult {
 }
 
 impl ListBucketsResult {
-    pub fn get_buckets(&self) -> &Vec<ListBucket> {
-        &self.buckets.bucket
+    pub fn get_buckets(&self) -> Vec<ListBucket> {
+        self.buckets.bucket.clone().unwrap_or_else(Vec::new)
     }
 }
 

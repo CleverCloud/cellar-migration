@@ -75,7 +75,7 @@ pub async fn migrate_bucket(
     debug!("radosgw_client: {:#?}", radosgw_client);
 
     let mut riak_objects = riak_client.list_objects(conf.max_keys).await?;
-    let radosgw_objects = match radosgw_client.list_objects().await {
+    let radosgw_objects = match radosgw_client.list_objects(None).await {
         Ok(objects) => objects,
         Err(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
             if conf.dry_run {
@@ -233,7 +233,7 @@ pub async fn create_destination_buckets(
                 Some(destination_bucket.clone()),
             );
 
-            match client_dry_run.list_objects().await {
+            match client_dry_run.list_objects(Some(1)).await {
                 Ok(_) | Err(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
                     info!("DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
                 }

@@ -202,8 +202,10 @@ impl RadosGW {
 
     pub async fn list_objects(
         &self,
+        max_results: Option<i64>,
     ) -> Result<Vec<rusoto_s3::Object>, RusotoError<ListObjectsV2Error>> {
         let mut results = Vec::new();
+        let mut total_keys: i64 = 0;
 
         loop {
             let list_objects_request = ListObjectsV2Request {
@@ -214,6 +216,7 @@ impl RadosGW {
                 start_after: results.last().map(|obj: &rusoto_s3::Object| {
                     String::from(obj.key.as_ref().expect("Object should have a key"))
                 }),
+                max_keys: max_results.map(|max| std::cmp::min(max, 1000)),
                 ..Default::default()
             };
 
@@ -227,7 +230,14 @@ impl RadosGW {
                 break;
             }
 
+            total_keys += objects.len() as i64;
             results.append(&mut objects);
+
+            if let Some(max_results) = max_results {
+                if total_keys >= max_results {
+                    break;
+                }
+            }
         }
 
         Ok(results)

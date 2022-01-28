@@ -92,7 +92,7 @@ checksum = "22a9137b95ea06864e018375b72adfb7db6e6f68cfc8df5a04d00288050485ee"
 
 [[package]]
 name = "cellar-migration"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "async-trait",

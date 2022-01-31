@@ -1,5 +1,6 @@
 use std::error;
 
+use futures::TryFutureExt;
 use log::{debug, error, info, warn};
 use rusoto_core::RusotoError;
 use rusoto_s3::{CreateBucketError, ListObjectsV2Error};
@@ -74,18 +75,25 @@ pub async fn migrate_bucket(
     debug!("riak client: {:#?}", riak_client);
     debug!("radosgw_client: {:#?}", radosgw_client);
 
-    let mut riak_objects = riak_client.list_objects(conf.max_keys).await?;
-    let radosgw_objects = match radosgw_client.list_objects(None).await {
-        Ok(objects) => objects,
-        Err(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
-            if conf.dry_run {
-                Vec::new()
-            } else {
-                panic!("Unexpected error: Destination bucket doesn't exist but we tried to list its files");
+    let riak_objects_fut = riak_client.list_objects(conf.max_keys);
+    let radosgw_objects_fut = radosgw_client.list_objects(None).or_else(|error| {
+        async move {
+            match error {
+                RusotoError::Service(ListObjectsV2Error::NoSuchBucket(bucket)) => {
+                    if conf.dry_run {
+                        Ok(Vec::new())
+                    } else {
+                        Err(anyhow::anyhow!("Unexpected error: Destination bucket {} doesn't exist but we tried to list its files", bucket))
+                    }
+                }
+                e => Err(anyhow::Error::from(e))
             }
         }
-        Err(e) => return Err(anyhow::Error::from(e)),
-    };
+    });
+
+    let objects_listing_result = futures::future::join(riak_objects_fut, radosgw_objects_fut).await;
+    let mut riak_objects = objects_listing_result.0?;
+    let radosgw_objects = objects_listing_result.1?;
 
     debug!("Riakcs objects: {}", riak_objects.len());
     debug!("Radosgw objects: {}", radosgw_objects.len());

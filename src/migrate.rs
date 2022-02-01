@@ -209,16 +209,16 @@ pub async fn create_destination_buckets(
         buckets
             .iter()
             .filter(|riakcs_bucket| {
+                let riakcs_bucket_name =
+                    format!("{}{}", destination_bucket_prefix, **riakcs_bucket);
+
                 !radosgw_buckets.iter().any(|radosgw_bucket| -> bool {
-                    let radosgw_bucket_name = format!(
-                        "{}{}",
-                        destination_bucket_prefix,
-                        radosgw_bucket
-                            .name
-                            .as_ref()
-                            .expect("RadosGW bucket should have a name")
-                    );
-                    **riakcs_bucket == radosgw_bucket_name
+                    let radosgw_bucket_name = radosgw_bucket
+                        .name
+                        .as_ref()
+                        .expect("RadosGW bucket should have a name");
+
+                    riakcs_bucket_name == *radosgw_bucket_name
                 })
             })
             .collect::<Vec<&String>>()
@@ -242,7 +242,8 @@ pub async fn create_destination_buckets(
             );
 
             match client_dry_run.list_objects(Some(1)).await {
-                Ok(_) | Err(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
+                Ok(_) => {}
+                Err(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
                     info!("DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
                 }
                 Err(e) => {

@@ -4,12 +4,12 @@ mod riakcs;
 
 use bytesize::ByteSize;
 use clap::{App, AppSettings, Arg, ArgMatches};
-use tracing::event;
-use tracing::Level;
-use tracing::instrument;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::format::{FmtSpan};
 use migrate::BucketMigrationConfiguration;
+use tracing::event;
+use tracing::instrument;
+use tracing::Level;
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
 
 use crate::migrate::{BucketMigrationError, BucketMigrationStats};
 use crate::riakcs::dto::ObjectContents;
@@ -18,8 +18,12 @@ use crate::riakcs::RiakCS;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_span_events(FmtSpan::ACTIVE)
+        .with_env_filter(
+            std::env::var(EnvFilter::DEFAULT_ENV)
+                .map(|_| EnvFilter::from_default_env())
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_span_events(FmtSpan::CLOSE | FmtSpan::NEW)
         .with_test_writer()
         .try_init();
 
@@ -118,7 +122,10 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         event!(Level::INFO, "Only bucket {} will be migrated", bucket);
         vec![bucket.clone()]
     } else {
-        event!(Level::INFO, "All buckets of this Cellar add-ons will be migrated");
+        event!(
+            Level::INFO,
+            "All buckets of this Cellar add-ons will be migrated"
+        );
         let riak_client = RiakCS::new(
             source_endpoint.clone(),
             source_access_key.clone(),
@@ -147,7 +154,10 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
     .await
     .is_err()
     {
-        event!(Level::ERROR, "Error while creating destination buckets. Aborting now.");
+        event!(
+            Level::ERROR,
+            "Error while creating destination buckets. Aborting now."
+        );
         std::process::exit(1);
     }
 
@@ -155,12 +165,17 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
 
     for bucket in &buckets_to_migrate {
         if dry_run {
-            event!(Level::INFO,
+            event!(
+                Level::INFO,
                 "DRY-RUN | Bucket {} | Starting listing of files that need to be synchronized",
                 bucket
             );
         } else {
-            event!(Level::INFO, "Bucket {} | Starting migration of bucket", bucket);
+            event!(
+                Level::INFO,
+                "Bucket {} | Starting migration of bucket",
+                bucket
+            );
         }
 
         let destination_bucket = if source_bucket.is_some() {
@@ -175,9 +190,11 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             bucket
         };
 
-        event!(Level::DEBUG,
+        event!(
+            Level::DEBUG,
             "Bucket {} | Starting synchronization of bucket with destination bucket {}",
-            bucket, destination_bucket
+            bucket,
+            destination_bucket
         );
 
         let bucket_migration = BucketMigrationConfiguration {
@@ -195,7 +212,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             dry_run,
         };
 
-        event!(Level::TRACE,
+        event!(
+            Level::TRACE,
             "Bucket {} | Bucket Migration Configuration: {:#?}",
             bucket,
             bucket_migration
@@ -203,13 +221,19 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
 
         let migration_result = migrate::migrate_bucket(bucket_migration).await;
 
-        event!(Level::DEBUG,
+        event!(
+            Level::DEBUG,
             "Bucket {} | Migration result: {:#?}",
-            bucket, migration_result
+            bucket,
+            migration_result
         );
 
         if !dry_run {
-            event!(Level::INFO, "Bucket {} | Bucket has been synchronized", bucket);
+            event!(
+                Level::INFO,
+                "Bucket {} | Bucket has been synchronized",
+                bucket
+            );
         }
 
         migration_results.push(migration_result);
@@ -233,7 +257,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             .flatten()
             .collect::<Vec<&ObjectContents>>();
 
-        event!(Level::INFO,
+        event!(
+            Level::INFO,
             "Those objects need to be sync: {:#?}",
             all_stats
                 .iter()
@@ -257,7 +282,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             .iter()
             .fold(0, |acc, object| acc + object.get_size() as u64);
 
-        event!(Level::INFO,
+        event!(
+            Level::INFO,
             "Total files to sync: {} for a total of {}",
             all_objects.len(),
             ByteSize(total_sync_bytes)
@@ -277,9 +303,11 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
                     event!(Level::ERROR, "Bucket {} | {}", bucket, f);
                 }
             } else {
-                event!(Level::ERROR,
+                event!(
+                    Level::ERROR,
                     "Bucket {} | Error during synchronization: {:#?}",
-                    bucket, error
+                    bucket,
+                    error
                 );
             }
         }
@@ -300,7 +328,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         }
     });
 
-    event!(Level::INFO,
+    event!(
+        Level::INFO,
         "Sync took {:?} for {} ({}/s)",
         elapsed,
         ByteSize(synchronization_size as u64),

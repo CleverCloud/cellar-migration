@@ -10,7 +10,7 @@ use rusoto_s3::{
     ListBucketsError, ListObjectsV2Error, ListObjectsV2Request, PutObjectError, PutObjectOutput,
     PutObjectRequest, S3Client, UploadPartError, UploadPartOutput, UploadPartRequest, S3,
 };
-use tracing::{instrument};
+use tracing::{event, instrument, Level};
 
 use crate::riakcs::dto::ObjectMetadataResponse;
 
@@ -37,7 +37,7 @@ impl RadosGW {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "trace")]
     fn get_client(&self) -> S3Client {
         let radosgw_credential_provider = awscredentials::AWSCredentialsProvider::new(
             self.access_key.clone(),
@@ -55,7 +55,7 @@ impl RadosGW {
         )
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub async fn put_object(
         &self,
         key: String,
@@ -90,7 +90,7 @@ impl RadosGW {
         client.put_object(put_object_request).await
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub async fn create_multipart_upload(
         &self,
         key: String,
@@ -123,7 +123,7 @@ impl RadosGW {
             .await
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub async fn put_object_part(
         &self,
         key: String,
@@ -149,7 +149,7 @@ impl RadosGW {
         client.upload_part(part_upload_request).await
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub async fn complete_multipart_upload(
         &self,
         key: String,
@@ -185,7 +185,7 @@ impl RadosGW {
             .await
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub async fn abort_multipart_upload(
         &self,
         key: String,
@@ -207,7 +207,7 @@ impl RadosGW {
             .await
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "trace")]
     pub async fn list_objects(
         &self,
         max_results: Option<i64>,
@@ -238,6 +238,8 @@ impl RadosGW {
                 break;
             }
 
+            event!(Level::TRACE, "{:?}", objects.last());
+
             total_keys += objects.len() as i64;
             results.append(&mut objects);
 
@@ -251,7 +253,7 @@ impl RadosGW {
         Ok(results)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub async fn list_buckets(&self) -> Result<Vec<Bucket>, RusotoError<ListBucketsError>> {
         let client = self.get_client();
         client
@@ -260,7 +262,7 @@ impl RadosGW {
             .map(|result| result.buckets.unwrap_or_default())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub async fn create_bucket(
         &self,
         bucket: String,

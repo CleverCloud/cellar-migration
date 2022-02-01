@@ -54,7 +54,7 @@ pub struct BucketMigrationConfiguration {
     pub dry_run: bool,
 }
 
-#[instrument(skip_all)]
+#[instrument(skip_all, level = "debug")]
 pub async fn migrate_bucket(
     conf: BucketMigrationConfiguration,
 ) -> anyhow::Result<BucketMigrationStats> {
@@ -194,7 +194,7 @@ pub async fn migrate_bucket(
     }
 }
 
-#[instrument(skip(destination_access_key, destination_secret_key))]
+#[instrument(skip(destination_access_key, destination_secret_key), level = "debug")]
 pub async fn create_destination_buckets(
     destination_endpoint: String,
     destination_access_key: String,

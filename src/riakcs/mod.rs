@@ -8,7 +8,7 @@ use hyper::{body::HttpBody, Body, Client, Method, Response};
 use hyper_tls::HttpsConnector;
 use ring::hmac;
 use serde::Deserialize;
-use tracing::{event, Level, instrument};
+use tracing::{event, instrument, Level};
 
 use crate::riakcs::dto::ListBucketsResult;
 
@@ -71,7 +71,7 @@ impl RiakCS {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     fn sign_string(&self, to_sign: String) -> String {
         let key = hmac::Key::new(
             hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
@@ -152,7 +152,7 @@ impl RiakCS {
         )
     }
 
-    #[instrument(skip(self, req))]
+    #[instrument(skip(self, req), level = "debug")]
     async fn send_request_deser<'de, T>(&self, req: hyper::Request<Body>) -> Result<T>
     where
         T: Deserialize<'de>,
@@ -178,12 +178,13 @@ impl RiakCS {
         }
     }
 
-    #[instrument(skip(self, req))]
+    #[instrument(skip(self, req), level = "debug")]
     async fn send_request(&self, req: hyper::Request<Body>) -> Result<Response<Body>> {
         let https = HttpsConnector::new();
         let client = Client::builder().build::<_, hyper::Body>(https);
 
-        event!(Level::TRACE,
+        event!(
+            Level::TRACE,
             "Sending {} request to {:?}",
             req.method().as_str(),
             req.uri()
@@ -194,7 +195,7 @@ impl RiakCS {
         Ok(response)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub async fn list_objects(&self, max_keys: usize) -> Result<Vec<ObjectContents>> {
         let mut results = Vec::new();
         let mut marker: Option<String> = None;
@@ -233,12 +234,13 @@ impl RiakCS {
         Ok(results)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     fn get_download_url(&self, object: &ObjectContents) -> String {
         let uri = self.get_uri();
         let expires = Utc::now() + Duration::hours(1);
         let signature = self.sign_url(object, expires);
-        event!(Level::TRACE,
+        event!(
+            Level::TRACE,
             "Expires: {:?}, now={:?}, signature={}",
             expires,
             Utc::now(),
@@ -255,7 +257,7 @@ impl RiakCS {
         )
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub async fn get_object(&self, object: &ObjectContents) -> Result<Response<Body>> {
         let url = self.get_download_url(object);
 
@@ -289,7 +291,7 @@ impl RiakCS {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     async fn _get_object_metadata(
         &self,
         object: &ObjectContents,
@@ -335,7 +337,7 @@ impl RiakCS {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     pub async fn get_object_metadata(
         &self,
         object: &ObjectContents,

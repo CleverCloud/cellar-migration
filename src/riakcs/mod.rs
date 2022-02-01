@@ -71,7 +71,7 @@ impl RiakCS {
         }
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     fn sign_string(&self, to_sign: String) -> String {
         let key = hmac::Key::new(
             hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
@@ -152,7 +152,7 @@ impl RiakCS {
         )
     }
 
-    #[instrument(skip(req))]
+    #[instrument(skip(self, req))]
     async fn send_request_deser<'de, T>(&self, req: hyper::Request<Body>) -> Result<T>
     where
         T: Deserialize<'de>,
@@ -178,7 +178,7 @@ impl RiakCS {
         }
     }
 
-    #[instrument(skip(req))]
+    #[instrument(skip(self, req))]
     async fn send_request(&self, req: hyper::Request<Body>) -> Result<Response<Body>> {
         let https = HttpsConnector::new();
         let client = Client::builder().build::<_, hyper::Body>(https);
@@ -194,7 +194,7 @@ impl RiakCS {
         Ok(response)
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     pub async fn list_objects(&self, max_keys: usize) -> Result<Vec<ObjectContents>> {
         let mut results = Vec::new();
         let mut marker: Option<String> = None;
@@ -233,7 +233,7 @@ impl RiakCS {
         Ok(results)
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     fn get_download_url(&self, object: &ObjectContents) -> String {
         let uri = self.get_uri();
         let expires = Utc::now() + Duration::hours(1);
@@ -255,7 +255,7 @@ impl RiakCS {
         )
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     pub async fn get_object(&self, object: &ObjectContents) -> Result<Response<Body>> {
         let url = self.get_download_url(object);
 
@@ -289,7 +289,7 @@ impl RiakCS {
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip(self))]
     async fn _get_object_metadata(
         &self,
         object: &ObjectContents,
@@ -335,7 +335,7 @@ impl RiakCS {
         }
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     pub async fn get_object_metadata(
         &self,
         object: &ObjectContents,

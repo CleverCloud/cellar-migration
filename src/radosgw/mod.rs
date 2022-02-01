@@ -37,6 +37,7 @@ impl RadosGW {
         }
     }
 
+    #[instrument(skip(self))]
     fn get_client(&self) -> S3Client {
         let radosgw_credential_provider = awscredentials::AWSCredentialsProvider::new(
             self.access_key.clone(),
@@ -54,6 +55,7 @@ impl RadosGW {
         )
     }
 
+    #[instrument(skip(self))]
     pub async fn put_object(
         &self,
         key: String,
@@ -88,6 +90,7 @@ impl RadosGW {
         client.put_object(put_object_request).await
     }
 
+    #[instrument(skip(self))]
     pub async fn create_multipart_upload(
         &self,
         key: String,
@@ -120,6 +123,7 @@ impl RadosGW {
             .await
     }
 
+    #[instrument(skip(self))]
     pub async fn put_object_part(
         &self,
         key: String,
@@ -145,6 +149,7 @@ impl RadosGW {
         client.upload_part(part_upload_request).await
     }
 
+    #[instrument(skip(self))]
     pub async fn complete_multipart_upload(
         &self,
         key: String,
@@ -180,6 +185,7 @@ impl RadosGW {
             .await
     }
 
+    #[instrument(skip(self))]
     pub async fn abort_multipart_upload(
         &self,
         key: String,
@@ -201,7 +207,7 @@ impl RadosGW {
             .await
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     pub async fn list_objects(
         &self,
         max_results: Option<i64>,
@@ -245,7 +251,7 @@ impl RadosGW {
         Ok(results)
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     pub async fn list_buckets(&self) -> Result<Vec<Bucket>, RusotoError<ListBucketsError>> {
         let client = self.get_client();
         client
@@ -254,7 +260,7 @@ impl RadosGW {
             .map(|result| result.buckets.unwrap_or_default())
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     pub async fn create_bucket(
         &self,
         bucket: String,

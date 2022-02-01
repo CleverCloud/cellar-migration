@@ -98,6 +98,7 @@ impl PartialEq<rusoto_s3::Object> for ObjectContents {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ObjectMetadataResponse {
     pub acl_public: bool,
     pub metadata: ObjectMetadata,
@@ -112,6 +113,7 @@ impl ObjectMetadataResponse {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ObjectMetadata {
     pub last_modified: Option<DateTime<FixedOffset>>,
     pub etag: Option<String>,

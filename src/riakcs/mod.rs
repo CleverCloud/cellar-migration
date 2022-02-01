@@ -6,9 +6,9 @@ use chrono::{DateTime, Duration, Utc};
 use dto::{ListObjectResponse, ObjectContents};
 use hyper::{body::HttpBody, Body, Client, Method, Response};
 use hyper_tls::HttpsConnector;
-use log::trace;
 use ring::hmac;
 use serde::Deserialize;
+use tracing::{event, Level, instrument};
 
 use crate::riakcs::dto::ListBucketsResult;
 
@@ -71,14 +71,15 @@ impl RiakCS {
         }
     }
 
+    #[instrument]
     fn sign_string(&self, to_sign: String) -> String {
         let key = hmac::Key::new(
             hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
             self.secret_key.as_bytes(),
         );
-        trace!("to sign: {:#?}", to_sign);
+        event!(Level::TRACE, "to sign: {:#?}", to_sign);
         let computed_hash = hmac::sign(&key, to_sign.as_bytes());
-        trace!("{:x?}", computed_hash.as_ref());
+        event!(Level::TRACE, "{:x?}", computed_hash.as_ref());
         base64::encode(computed_hash.as_ref())
     }
 
@@ -151,6 +152,7 @@ impl RiakCS {
         )
     }
 
+    #[instrument(skip(req))]
     async fn send_request_deser<'de, T>(&self, req: hyper::Request<Body>) -> Result<T>
     where
         T: Deserialize<'de>,
@@ -163,7 +165,7 @@ impl RiakCS {
         }
 
         let data_str = String::from_utf8_lossy(&body[..]);
-        trace!("{}", data_str);
+        event!(Level::TRACE, "{}", data_str);
 
         if response.status().is_success() {
             Ok(serde_xml_rs::from_str(&data_str)?)
@@ -176,21 +178,23 @@ impl RiakCS {
         }
     }
 
+    #[instrument(skip(req))]
     async fn send_request(&self, req: hyper::Request<Body>) -> Result<Response<Body>> {
         let https = HttpsConnector::new();
         let client = Client::builder().build::<_, hyper::Body>(https);
 
-        trace!(
+        event!(Level::TRACE,
             "Sending {} request to {:?}",
             req.method().as_str(),
             req.uri()
         );
         let response = client.request(req).await?;
 
-        trace!("{:#?}", response);
+        event!(Level::TRACE, "{:#?}", response);
         Ok(response)
     }
 
+    #[instrument]
     pub async fn list_objects(&self, max_keys: usize) -> Result<Vec<ObjectContents>> {
         let mut results = Vec::new();
         let mut marker: Option<String> = None;
@@ -205,14 +209,14 @@ impl RiakCS {
                     .unwrap_or_else(String::new)
             );
 
-            trace!("Build request with uri: {}", uri);
+            event!(Level::TRACE, "Build request with uri: {}", uri);
             let mut req = hyper::Request::builder()
                 .method(Method::GET)
                 .uri(uri)
                 .body(Body::empty())?;
 
             self.sign_request(&mut req);
-            trace!("{:#?}", req);
+            event!(Level::TRACE, "{:#?}", req);
 
             let response: ListObjectResponse = self.send_request_deser(req).await?;
 
@@ -229,11 +233,12 @@ impl RiakCS {
         Ok(results)
     }
 
+    #[instrument]
     fn get_download_url(&self, object: &ObjectContents) -> String {
         let uri = self.get_uri();
         let expires = Utc::now() + Duration::hours(1);
         let signature = self.sign_url(object, expires);
-        trace!(
+        event!(Level::TRACE,
             "Expires: {:?}, now={:?}, signature={}",
             expires,
             Utc::now(),
@@ -250,6 +255,7 @@ impl RiakCS {
         )
     }
 
+    #[instrument]
     pub async fn get_object(&self, object: &ObjectContents) -> Result<Response<Body>> {
         let url = self.get_download_url(object);
 
@@ -278,11 +284,12 @@ impl RiakCS {
         }
 
         let data_str = String::from_utf8_lossy(&body[..]);
-        trace!("{}", data_str);
+        event!(Level::TRACE, "{}", data_str);
 
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn _get_object_metadata(
         &self,
         object: &ObjectContents,
@@ -328,6 +335,7 @@ impl RiakCS {
         }
     }
 
+    #[instrument]
     pub async fn get_object_metadata(
         &self,
         object: &ObjectContents,

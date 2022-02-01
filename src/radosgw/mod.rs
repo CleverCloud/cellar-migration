@@ -10,6 +10,7 @@ use rusoto_s3::{
     ListBucketsError, ListObjectsV2Error, ListObjectsV2Request, PutObjectError, PutObjectOutput,
     PutObjectRequest, S3Client, UploadPartError, UploadPartOutput, UploadPartRequest, S3,
 };
+use tracing::{instrument};
 
 use crate::riakcs::dto::ObjectMetadataResponse;
 
@@ -200,6 +201,7 @@ impl RadosGW {
             .await
     }
 
+    #[instrument]
     pub async fn list_objects(
         &self,
         max_results: Option<i64>,
@@ -243,6 +245,7 @@ impl RadosGW {
         Ok(results)
     }
 
+    #[instrument]
     pub async fn list_buckets(&self) -> Result<Vec<Bucket>, RusotoError<ListBucketsError>> {
         let client = self.get_client();
         client
@@ -251,6 +254,7 @@ impl RadosGW {
             .map(|result| result.buckets.unwrap_or_default())
     }
 
+    #[instrument]
     pub async fn create_bucket(
         &self,
         bucket: String,

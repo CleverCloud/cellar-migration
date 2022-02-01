@@ -8,9 +8,10 @@ use std::{
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use hyper::body::HttpBody;
-use log::{debug, info, trace, warn};
 use rusoto_core::ByteStream;
 use tokio::task::JoinError;
+use tracing::event;
+use tracing::Level;
 
 use crate::riakcs::{
     dto::{get_part_size_from_etag, ObjectContents, ObjectMetadataResponse},
@@ -40,7 +41,7 @@ impl Uploader {
     ) -> Uploader {
         let objects_len = objects.len();
         if objects_len < threads {
-            warn!(
+            event!(Level::WARN,
                 "There are more threads than files to synchronize. I'll only start {} threads",
                 objects_len
             );
@@ -56,7 +57,7 @@ impl Uploader {
     }
 
     pub async fn sync(&mut self) -> Vec<Result<Vec<anyhow::Result<ObjectContents>>, JoinError>> {
-        info!("Starting {} sync threads", self.threads);
+        event!(Level::INFO, "Starting {} sync threads", self.threads);
         let mut handles = Vec::new();
         let total_files = self.objects.clone().lock().unwrap().len();
 
@@ -76,7 +77,7 @@ impl Uploader {
                     };
 
                     if let Some(object) = object {
-                        info!(
+                        event!(Level::INFO,
                             "Thread {} | ({}/{}) Starting to sync object {}",
                             thread_id,
                             total_files - remaining,
@@ -96,7 +97,7 @@ impl Uploader {
 
                         results.push(result);
                     } else {
-                        info!(
+                        event!(Level::INFO,
                             "Thread {} | No more objects to synchronize, quitting..",
                             thread_id
                         );
@@ -134,7 +135,7 @@ impl Uploader {
                 if part_size >= RADOSGW_MIN_PART_SIZE {
                     Some(part_size)
                 } else {
-                    warn!("Object {} has been initially uploaded using multipart upload with parts less than 5MB. A different part size will be used if needed.", object.get_key());
+                    event!(Level::WARN, "Object {} has been initially uploaded using multipart upload with parts less than 5MB. A different part size will be used if needed.", object.get_key());
                     None
                 }
             } else {
@@ -178,7 +179,7 @@ impl Uploader {
                 )
                 .await?;
             }
-            info!(
+            event!(Level::INFO,
                 "Thread {} | Object {} has been put in {:?}",
                 thread_id,
                 object.get_key(),
@@ -225,7 +226,7 @@ impl Uploader {
 
         match response {
             Ok(put_object_output) => {
-                trace!("Thread {} | {:#?}", thread_id, put_object_output);
+                event!(Level::TRACE, "Thread {} | {:#?}", thread_id, put_object_output);
                 Ok(())
             }
             Err(error) => Err(anyhow::Error::from(error)),
@@ -241,7 +242,7 @@ impl Uploader {
         thread_id: usize,
     ) -> anyhow::Result<()> {
         let total_parts = (object.get_size() as f64 / multipart_chunk_size as f64).ceil() as usize;
-        debug!("Thread {} | Initiating multipart upload for object {}. object_size={}, part_size={}, total_parts={}", thread_id, object.get_key(), object.get_size(), multipart_chunk_size, total_parts);
+        event!(Level::DEBUG, "Thread {} | Initiating multipart upload for object {}. object_size={}, part_size={}, total_parts={}", thread_id, object.get_key(), object.get_size(), multipart_chunk_size, total_parts);
         let multipart_upload = radosgw_client
             .create_multipart_upload(object.get_key(), object_metadata)
             .await?;
@@ -256,7 +257,7 @@ impl Uploader {
             let radosgw_part_number = part_number + 1;
             let remaining = object.get_size() as usize - total_uploaded;
             let part_size = std::cmp::min(remaining, multipart_chunk_size);
-            debug!(
+            event!(Level::DEBUG,
                 "Thread {} | Object {}, total_uploaded={}, remaining={}, part_size={}",
                 thread_id,
                 object.get_key(),
@@ -275,7 +276,7 @@ impl Uploader {
                 )
                 .await;
 
-            debug!(
+            event!(Level::DEBUG,
                 "Thread {} | Upload part response: {:#?}",
                 thread_id, upload_part_response
             );
@@ -285,7 +286,7 @@ impl Uploader {
                     completed_parts.push((radosgw_part_number, response));
                 }
                 Err(error) => {
-                    debug!(
+                    event!(Level::DEBUG,
                         "Thread {} | Multipart upload aborted for {}",
                         thread_id,
                         object.get_key()
@@ -308,7 +309,7 @@ impl Uploader {
         {
             Ok(_) => {}
             Err(error) => {
-                debug!(
+                event!(Level::DEBUG,
                     "Thread {} | Multipart upload failed to complete for {}, reason={:#?}",
                     thread_id,
                     object.get_key(),
@@ -321,7 +322,7 @@ impl Uploader {
             }
         }
 
-        debug!(
+        event!(Level::DEBUG,
             "Thread {} | Multipart upload for object {} has finished.",
             thread_id,
             object.get_key()
@@ -420,25 +421,25 @@ impl Stream for RiakResponseStreamChunk {
 
     #[allow(clippy::branches_sharing_code)]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        trace!("RiakResponseStreamChunk: poll_next, chunk_size={}, chunks_len={}, returned_bytes={}, state={:?}", self.chunk_size, self.chunks.len(), self.returned_bytes, self.state);
+        event!(Level::TRACE, "RiakResponseStreamChunk: poll_next, chunk_size={}, chunks_len={}, returned_bytes={}, state={:?}", self.chunk_size, self.chunks.len(), self.returned_bytes, self.state);
         if let RiakResponseStreamChunkState::Error(err) = &self.state {
             return Poll::Ready(Some(Err(std::io::Error::new(err.kind(), err.to_string()))));
         }
 
         match Pin::new(&mut self.response).poll_next(cx) {
             Poll::Ready(None) => {
-                trace!("RiakResponseStreamChunk poll: got EOF from riak");
+                event!(Level::TRACE, "RiakResponseStreamChunk poll: got EOF from riak");
                 self.state = RiakResponseStreamChunkState::Ended;
             }
             Poll::Ready(Some(Ok(bytes))) => {
-                trace!(
+                event!(Level::TRACE,
                     "RiakResponseStreamChunk: Got new chunk of length: {}",
                     bytes.len()
                 );
                 self.chunks.push_back(bytes);
             }
             Poll::Ready(Some(Err(error))) => {
-                trace!(
+                event!(Level::TRACE,
                     "RiakResponseStreamChunk: Got error from stream, {:?}",
                     error
                 );
@@ -448,32 +449,32 @@ impl Stream for RiakResponseStreamChunk {
         };
 
         if self.returned_bytes == self.chunk_size {
-            trace!("RiakResponseStreamChunk: our stream has returned all needed bytes for now. Reset returned_bytes to 0.");
+            event!(Level::TRACE, "RiakResponseStreamChunk: our stream has returned all needed bytes for now. Reset returned_bytes to 0.");
             self.returned_bytes = 0;
         }
 
         if !self.chunks.is_empty() {
-            trace!(
+            event!(Level::TRACE,
                 "RiakResponseStreamChunk: we have some chunks ({}) to return. returned_bytes={}",
                 self.chunks.len(),
                 self.returned_bytes
             );
             let mut chunk = self.chunks.pop_front().unwrap();
             let diff = self.chunk_size - self.returned_bytes;
-            trace!(
+            event!(Level::TRACE,
                 "RiakResponseStreamChunk: current chunk len={}, diff={}",
                 chunk.len(),
                 diff
             );
             if diff > chunk.len() {
                 self.returned_bytes += chunk.len();
-                trace!("RiakResponseStreamChunk: chunk is smaller than needed diff, returning it. returned_bytes={}", self.returned_bytes);
+                event!(Level::TRACE, "RiakResponseStreamChunk: chunk is smaller than needed diff, returning it. returned_bytes={}", self.returned_bytes);
                 Poll::Ready(Some(Ok(chunk)))
             } else {
                 let new_chunk = chunk.split_off(diff);
                 self.chunks.push_front(new_chunk);
                 self.returned_bytes += chunk.len();
-                trace!("RiakResponseStreamChunk: chunk is bigger than needed diff, only returning a portion. returned_bytes={}", self.returned_bytes);
+                event!(Level::TRACE, "RiakResponseStreamChunk: chunk is bigger than needed diff, only returning a portion. returned_bytes={}", self.returned_bytes);
                 Poll::Ready(Some(Ok(chunk)))
             }
         } else if let RiakResponseStreamChunkState::Ended = self.state {

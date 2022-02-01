@@ -4,8 +4,11 @@ mod riakcs;
 
 use bytesize::ByteSize;
 use clap::{App, AppSettings, Arg, ArgMatches};
-use log::LevelFilter;
-use log::{debug, error, info, trace, warn};
+use tracing::event;
+use tracing::Level;
+use tracing::instrument;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::{FmtSpan};
 use migrate::BucketMigrationConfiguration;
 
 use crate::migrate::{BucketMigrationError, BucketMigrationStats};
@@ -14,10 +17,11 @@ use crate::riakcs::RiakCS;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_default_env()
-        .default_format()
-        .filter_level(LevelFilter::Info)
-        .init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_span_events(FmtSpan::ACTIVE)
+        .with_test_writer()
+        .try_init();
 
     let num_cpus = num_cpus::get();
     let clap = clap::app_from_crate!()
@@ -63,11 +67,12 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+#[instrument(skip_all)]
 async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
     let dry_run = params.occurrences_of("execute") == 0;
 
     if dry_run {
-        warn!("Running in dry run mode. No changes will be made. If you want to synchronize for real, use --execute");
+        event!(Level::WARN, "Running in dry run mode. No changes will be made. If you want to synchronize for real, use --execute");
     }
 
     let sync_threads = params
@@ -103,17 +108,17 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
     let destination_endpoint = params.value_of("destination-endpoint").unwrap().to_string();
 
     if source_bucket.is_none() && destination_bucket.is_some() {
-        error!("You can't give a destination bucket without a source bucket. Please specify the --source-bucket option");
+        event!(Level::ERROR, "You can't give a destination bucket without a source bucket. Please specify the --source-bucket option");
         std::process::exit(1);
     }
 
     let sync_start = std::time::Instant::now();
 
     let buckets_to_migrate = if let Some(bucket) = source_bucket.as_ref() {
-        info!("Only bucket {} will be migrated", bucket);
+        event!(Level::INFO, "Only bucket {} will be migrated", bucket);
         vec![bucket.clone()]
     } else {
-        info!("All buckets of this Cellar add-ons will be migrated");
+        event!(Level::INFO, "All buckets of this Cellar add-ons will be migrated");
         let riak_client = RiakCS::new(
             source_endpoint.clone(),
             source_access_key.clone(),
@@ -142,7 +147,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
     .await
     .is_err()
     {
-        error!("Error while creating destination buckets. Aborting now.");
+        event!(Level::ERROR, "Error while creating destination buckets. Aborting now.");
         std::process::exit(1);
     }
 
@@ -150,12 +155,12 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
 
     for bucket in &buckets_to_migrate {
         if dry_run {
-            info!(
+            event!(Level::INFO,
                 "DRY-RUN | Bucket {} | Starting listing of files that need to be synchronized",
                 bucket
             );
         } else {
-            info!("Bucket {} | Starting migration of bucket", bucket);
+            event!(Level::INFO, "Bucket {} | Starting migration of bucket", bucket);
         }
 
         let destination_bucket = if source_bucket.is_some() {
@@ -170,7 +175,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             bucket
         };
 
-        debug!(
+        event!(Level::DEBUG,
             "Bucket {} | Starting synchronization of bucket with destination bucket {}",
             bucket, destination_bucket
         );
@@ -190,7 +195,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             dry_run,
         };
 
-        trace!(
+        event!(Level::TRACE,
             "Bucket {} | Bucket Migration Configuration: {:#?}",
             bucket,
             bucket_migration
@@ -198,13 +203,13 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
 
         let migration_result = migrate::migrate_bucket(bucket_migration).await;
 
-        debug!(
+        event!(Level::DEBUG,
             "Bucket {} | Migration result: {:#?}",
             bucket, migration_result
         );
 
         if !dry_run {
-            info!("Bucket {} | Bucket has been synchronized", bucket);
+            event!(Level::INFO, "Bucket {} | Bucket has been synchronized", bucket);
         }
 
         migration_results.push(migration_result);
@@ -228,7 +233,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             .flatten()
             .collect::<Vec<&ObjectContents>>();
 
-        info!(
+        event!(Level::INFO,
             "Those objects need to be sync: {:#?}",
             all_stats
                 .iter()
@@ -246,13 +251,13 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
                 .collect::<Vec<String>>()
         );
 
-        debug!("Objects to sync: {:#?}", all_objects);
+        event!(Level::DEBUG, "Objects to sync: {:#?}", all_objects);
 
         let total_sync_bytes = all_objects
             .iter()
             .fold(0, |acc, object| acc + object.get_size() as u64);
 
-        info!(
+        event!(Level::INFO,
             "Total files to sync: {} for a total of {}",
             all_objects.len(),
             ByteSize(total_sync_bytes)
@@ -269,10 +274,10 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         if let Err(error) = migration_result {
             if let Some(err) = error.downcast_ref::<BucketMigrationError>() {
                 for f in &err.errors {
-                    error!("Bucket {} | {}", bucket, f);
+                    event!(Level::ERROR, "Bucket {} | {}", bucket, f);
                 }
             } else {
-                error!(
+                event!(Level::ERROR,
                     "Bucket {} | Error during synchronization: {:#?}",
                     bucket, error
                 );
@@ -295,7 +300,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         }
     });
 
-    info!(
+    event!(Level::INFO,
         "Sync took {:?} for {} ({}/s)",
         elapsed,
         ByteSize(synchronization_size as u64),

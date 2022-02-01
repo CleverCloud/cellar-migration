@@ -1,10 +1,11 @@
 use std::error;
 
 use futures::TryFutureExt;
-use log::{debug, error, info, warn};
+
 use rusoto_core::RusotoError;
 use rusoto_s3::{CreateBucketError, ListObjectsV2Error};
 use std::time::Duration;
+use tracing::{event, instrument, Level};
 
 use crate::{
     radosgw::{uploader::Uploader, RadosGW},
@@ -53,6 +54,7 @@ pub struct BucketMigrationConfiguration {
     pub dry_run: bool,
 }
 
+#[instrument(skip_all)]
 pub async fn migrate_bucket(
     conf: BucketMigrationConfiguration,
 ) -> anyhow::Result<BucketMigrationStats> {
@@ -72,8 +74,8 @@ pub async fn migrate_bucket(
         Some(conf.destination_bucket),
     );
 
-    debug!("riak client: {:#?}", riak_client);
-    debug!("radosgw_client: {:#?}", radosgw_client);
+    event!(Level::DEBUG, "riak client: {:#?}", riak_client);
+    event!(Level::DEBUG, "radosgw_client: {:#?}", radosgw_client);
 
     let riak_objects_fut = riak_client.list_objects(conf.max_keys);
     let radosgw_objects_fut = radosgw_client.list_objects(None).or_else(|error| {
@@ -95,8 +97,8 @@ pub async fn migrate_bucket(
     let mut riak_objects = objects_listing_result.0?;
     let radosgw_objects = objects_listing_result.1?;
 
-    debug!("Riakcs objects: {}", riak_objects.len());
-    debug!("Radosgw objects: {}", radosgw_objects.len());
+    event!(Level::DEBUG, "Riakcs objects: {}", riak_objects.len());
+    event!(Level::DEBUG, "Radosgw objects: {}", radosgw_objects.len());
 
     riak_objects.retain(|object| {
         if let Some(found) = radosgw_objects
@@ -170,7 +172,11 @@ pub async fn migrate_bucket(
                 })
             }
         } else {
-            warn!("{} | No files to synchronize", conf.source_bucket);
+            event!(
+                Level::WARN,
+                "{} | No files to synchronize",
+                conf.source_bucket
+            );
             Ok(BucketMigrationStats {
                 bucket: conf.source_bucket.clone(),
                 synchronization_time: sync_start.elapsed(),
@@ -188,6 +194,7 @@ pub async fn migrate_bucket(
     }
 }
 
+#[instrument(skip(destination_access_key, destination_secret_key))]
 pub async fn create_destination_buckets(
     destination_endpoint: String,
     destination_access_key: String,
@@ -244,7 +251,7 @@ pub async fn create_destination_buckets(
             match client_dry_run.list_objects(Some(1)).await {
                 Ok(_) => {}
                 Err(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
-                    info!("DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
+                    event!(Level::INFO, "DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
                 }
                 Err(e) => {
                     bucket_already_created(&destination_bucket);
@@ -252,7 +259,8 @@ pub async fn create_destination_buckets(
                 }
             }
         } else {
-            info!(
+            event!(
+                Level::INFO,
                 "Bucket {} | Bucket is missing on the destination add-on. I will try to create it",
                 bucket
             );
@@ -260,7 +268,11 @@ pub async fn create_destination_buckets(
             match client.create_bucket(destination_bucket.clone()).await {
                 Ok(_)
                 | Err(RusotoError::Service(CreateBucketError::BucketAlreadyOwnedByYou(_))) => {
-                    info!("Bucket {} | Bucket created", destination_bucket)
+                    event!(
+                        Level::INFO,
+                        "Bucket {} | Bucket created",
+                        destination_bucket
+                    )
                 }
                 Err(e) => {
                     bucket_already_created(&destination_bucket);
@@ -274,6 +286,6 @@ pub async fn create_destination_buckets(
 }
 
 fn bucket_already_created(bucket: &str) {
-    error!("Bucket {} | Bucket can't be created because it probably has been created in another Cellar add-on, maybe by another user.", bucket);
-    error!("Please refer to https://github.com/CleverCloud/cellar-c1-migration-tool/#my-bucket-already-exists-on-the-destination-cluster to find a workaround");
+    event!(Level::ERROR, "Bucket {} | Bucket can't be created because it probably has been created in another Cellar add-on, maybe by another user.", bucket);
+    event!(Level::ERROR, "Please refer to https://github.com/CleverCloud/cellar-c1-migration-tool/#my-bucket-already-exists-on-the-destination-cluster to find a workaround");
 }

@@ -2,8 +2,9 @@ use std::str::FromStr;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use hyper::{Body, Response};
-use log::{trace, warn};
+
 use serde_derive::Deserialize;
+use tracing::{event, Level};
 
 use crate::radosgw::uploader::RADOSGW_MIN_PART_SIZE;
 
@@ -67,7 +68,7 @@ impl ListObjectResponse {
 
 impl PartialEq<rusoto_s3::Object> for ObjectContents {
     fn eq(&self, other: &rusoto_s3::Object) -> bool {
-        trace!("Self: {:#?}\nOther: {:#?}", self, other);
+        event!(Level::TRACE, "Self: {:#?}\nOther: {:#?}", self, other);
 
         if other.key == Some(self.get_key()) && other.size == Some(self.get_size() as i64) {
             if other.e_tag == Some(self.get_etag()) {
@@ -75,7 +76,7 @@ impl PartialEq<rusoto_s3::Object> for ObjectContents {
             } else if self.get_etag().contains('-') {
                 let part_size = get_part_size_from_etag(&self.get_etag(), self.get_size() as usize);
                 if part_size < RADOSGW_MIN_PART_SIZE {
-                    warn!("Object {} has been uploaded using multipart upload with a part size less than 5MB. Falling back to last modification date to compare objects.", self.get_key());
+                    event!(Level::WARN, "Object {} has been uploaded using multipart upload with a part size less than 5MB. Falling back to last modification date to compare objects.", self.get_key());
                     let other_date: Option<DateTime<Utc>> = other
                         .last_modified
                         .as_ref()

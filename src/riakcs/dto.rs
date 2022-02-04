@@ -67,6 +67,7 @@ impl ListObjectResponse {
 }
 
 impl PartialEq<rusoto_s3::Object> for ObjectContents {
+    #[instrument(skip_all, level = "trace")]
     fn eq(&self, other: &rusoto_s3::Object) -> bool {
         event!(Level::TRACE, "Self: {:#?}\nOther: {:#?}", self, other);
 

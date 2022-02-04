@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-#[instrument(skip_all)]
+#[instrument(skip_all, level = "debug")]
 async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
     let dry_run = params.occurrences_of("execute") == 0;
 
@@ -222,7 +222,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         let migration_result = migrate::migrate_bucket(bucket_migration).await;
 
         event!(
-            Level::DEBUG,
+            Level::TRACE,
             "Bucket {} | Migration result: {:#?}",
             bucket,
             migration_result
@@ -276,7 +276,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
                 .collect::<Vec<String>>()
         );
 
-        event!(Level::DEBUG, "Objects to sync: {:#?}", all_objects);
+        event!(Level::TRACE, "Objects to sync: {:#?}", all_objects);
 
         let total_sync_bytes = all_objects
             .iter()

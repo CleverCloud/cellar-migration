@@ -1,4 +1,4 @@
-use std::error;
+use std::{collections::HashMap, error};
 
 use futures::TryFutureExt;
 
@@ -83,7 +83,7 @@ pub async fn migrate_bucket(
             match error {
                 RusotoError::Service(ListObjectsV2Error::NoSuchBucket(bucket)) => {
                     if conf.dry_run {
-                        Ok(Vec::new())
+                        Ok(HashMap::new())
                     } else {
                         Err(anyhow::anyhow!("Unexpected error: Destination bucket {} doesn't exist but we tried to list its files", bucket))
                     }
@@ -100,23 +100,22 @@ pub async fn migrate_bucket(
     event!(Level::DEBUG, "Riakcs objects: {}", riak_objects.len());
     event!(Level::DEBUG, "Radosgw objects: {}", radosgw_objects.len());
 
-    riak_objects.retain(|object| {
-        if let Some(found) = radosgw_objects
-            .iter()
-            .find(|&robject| robject.key == Some(object.get_key()))
-        {
+    riak_objects.retain(|key, object| {
+        if let Some(found) = radosgw_objects.get(key) {
             object != found
         } else {
             true
         }
     });
 
+    let objects_to_migrate: Vec<ObjectContents> = riak_objects.into_values().collect();
+
     if !conf.dry_run {
-        if !riak_objects.is_empty() {
+        if !objects_to_migrate.is_empty() {
             let mut uploader = Uploader::new(
                 riak_client,
                 radosgw_client,
-                riak_objects.clone(),
+                objects_to_migrate.clone(),
                 conf.sync_threads,
                 conf.chunk_size,
             );
@@ -149,7 +148,7 @@ pub async fn migrate_bucket(
                                 .collect::<Vec<&ObjectContents>>()
                         })
                         .fold(0, |acc, object| acc + object.get_size() as usize),
-                    objects: riak_objects,
+                    objects: objects_to_migrate,
                 };
 
                 Err(anyhow::Error::new(BucketMigrationError {
@@ -165,10 +164,10 @@ pub async fn migrate_bucket(
                 Ok(BucketMigrationStats {
                     bucket: conf.source_bucket.clone(),
                     synchronization_time: sync_start.elapsed(),
-                    synchronization_size: riak_objects
+                    synchronization_size: objects_to_migrate
                         .iter()
                         .fold(0, |acc, obj| acc + obj.get_size() as usize),
-                    objects: riak_objects,
+                    objects: objects_to_migrate,
                 })
             }
         } else {
@@ -181,7 +180,7 @@ pub async fn migrate_bucket(
                 bucket: conf.source_bucket.clone(),
                 synchronization_time: sync_start.elapsed(),
                 synchronization_size: 0,
-                objects: riak_objects,
+                objects: objects_to_migrate,
             })
         }
     } else {
@@ -189,7 +188,7 @@ pub async fn migrate_bucket(
             bucket: conf.source_bucket.clone(),
             synchronization_time: sync_start.elapsed(),
             synchronization_size: 0,
-            objects: riak_objects,
+            objects: objects_to_migrate,
         })
     }
 }

@@ -4,7 +4,7 @@ use chrono::{DateTime, FixedOffset, Utc};
 use hyper::{Body, Response};
 
 use serde_derive::Deserialize;
-use tracing::{event, Level};
+use tracing::{event, instrument, Level};
 
 use crate::radosgw::uploader::RADOSGW_MIN_PART_SIZE;
 

@@ -1,6 +1,8 @@
 pub mod awscredentials;
 pub mod uploader;
 
+use std::collections::HashMap;
+
 use rusoto_core::{ByteStream, RusotoError};
 use rusoto_s3::{
     AbortMultipartUploadError, AbortMultipartUploadOutput, AbortMultipartUploadRequest, Bucket,
@@ -211,8 +213,9 @@ impl RadosGW {
     pub async fn list_objects(
         &self,
         max_results: Option<i64>,
-    ) -> Result<Vec<rusoto_s3::Object>, RusotoError<ListObjectsV2Error>> {
-        let mut results = Vec::new();
+    ) -> Result<HashMap<String, rusoto_s3::Object>, RusotoError<ListObjectsV2Error>> {
+        let mut results = HashMap::new();
+        let mut start_after = None;
         let mut total_keys: i64 = 0;
 
         loop {
@@ -221,15 +224,13 @@ impl RadosGW {
                     .bucket
                     .clone()
                     .expect("list_objects should have a bucket"),
-                start_after: results.last().map(|obj: &rusoto_s3::Object| {
-                    String::from(obj.key.as_ref().expect("Object should have a key"))
-                }),
+                start_after,
                 max_keys: max_results.map(|max| std::cmp::min(max, 1000)),
                 ..Default::default()
             };
 
             let client = self.get_client();
-            let mut objects = client
+            let objects = client
                 .list_objects_v2(list_objects_request.clone())
                 .await
                 .map(|res| res.contents.unwrap_or_default())?;
@@ -241,7 +242,15 @@ impl RadosGW {
             event!(Level::TRACE, "{:?}", objects.last());
 
             total_keys += objects.len() as i64;
-            results.append(&mut objects);
+
+            start_after = objects.last().and_then(|o| o.key.clone());
+
+            for object in objects {
+                results.insert(
+                    object.key.clone().expect("Object should have a key"),
+                    object,
+                );
+            }
 
             if let Some(max_results) = max_results {
                 if total_keys >= max_results {

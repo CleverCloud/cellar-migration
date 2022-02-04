@@ -1,5 +1,7 @@
 pub mod dto;
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use bytes::{BufMut, BytesMut};
 use chrono::{DateTime, Duration, Utc};
@@ -196,8 +198,8 @@ impl RiakCS {
     }
 
     #[instrument(skip(self), level = "debug")]
-    pub async fn list_objects(&self, max_keys: usize) -> Result<Vec<ObjectContents>> {
-        let mut results = Vec::new();
+    pub async fn list_objects(&self, max_keys: usize) -> Result<HashMap<String, ObjectContents>> {
+        let mut results = HashMap::new();
         let mut marker: Option<String> = None;
         loop {
             let uri = format!(
@@ -221,11 +223,14 @@ impl RiakCS {
 
             let response: ListObjectResponse = self.send_request_deser(req).await?;
 
-            results.append(&mut response.get_objects());
+            let objects = response.get_objects();
+            let last_object = objects.last().map(|o| o.get_key());
+            for object in objects {
+                results.insert(object.get_key(), object);
+            }
 
             if response.truncated() {
-                let last = results.last().expect("Should have last item");
-                marker = Some(last.get_key().clone());
+                marker = last_object;
             } else {
                 break;
             }

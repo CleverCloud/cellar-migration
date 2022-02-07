@@ -40,6 +40,9 @@ it will only run in a dry mode and list files that need to be synchronized.
 
 You can also configure the multipart chunk size if needed, by default it is 100MB.
 
+A `--delete` option exists to delete files on the remote bucket that are not on the source bucket. Be careful: if your bucket already had files before a first synchronization, then
+those file will probably end up being deleted.
+
 
 ## My bucket already exists on the destination cluster
 

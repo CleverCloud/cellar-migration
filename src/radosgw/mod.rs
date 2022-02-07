@@ -9,8 +9,9 @@ use rusoto_s3::{
     CompleteMultipartUploadError, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
     CompletedMultipartUpload, CompletedPart, CreateBucketError, CreateBucketRequest,
     CreateMultipartUploadError, CreateMultipartUploadOutput, CreateMultipartUploadRequest,
-    ListBucketsError, ListObjectsV2Error, ListObjectsV2Request, PutObjectError, PutObjectOutput,
-    PutObjectRequest, S3Client, UploadPartError, UploadPartOutput, UploadPartRequest, S3,
+    DeleteObjectError, DeleteObjectRequest, ListBucketsError, ListObjectsV2Error,
+    ListObjectsV2Request, Object, PutObjectError, PutObjectOutput, PutObjectRequest, S3Client,
+    UploadPartError, UploadPartOutput, UploadPartRequest, S3,
 };
 use tracing::{event, instrument, Level};
 
@@ -260,6 +261,27 @@ impl RadosGW {
         }
 
         Ok(results)
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    pub async fn delete_object(
+        &self,
+        object: Object,
+    ) -> Result<Object, RusotoError<DeleteObjectError>> {
+        let client = self.get_client();
+        let delete_object_request = DeleteObjectRequest {
+            bucket: self
+                .bucket
+                .clone()
+                .expect("delete_object should have a bucket"),
+            key: object.key.clone().unwrap(),
+            ..Default::default()
+        };
+
+        client
+            .delete_object(delete_object_request)
+            .await
+            .map(|_| object)
     }
 
     #[instrument(skip(self), level = "debug")]

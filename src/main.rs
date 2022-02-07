@@ -62,6 +62,11 @@ async fn main() -> anyhow::Result<()> {
                 .help("Define the maximum number of object keys to list when listing the bucket. Lowering this might help listing huge buckets")
                 .required(false).takes_value(true).default_value("1000")
             )
+            .arg(
+                Arg::new("delete").long("delete").short('d')
+                .help("Delete extraneous files from destination bucket")
+                .required(false).takes_value(false)
+            )
         )
         .get_matches();
 
@@ -90,6 +95,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
     let max_keys = params
         .value_of_t::<usize>("max-keys")
         .expect("max-keys should be a usize");
+
+    let delete_destination_files = params.occurrences_of("delete") > 0;
 
     let source_bucket = params.value_of("source-bucket").map(|b| b.to_string());
     let source_access_key = params.value_of("source-access-key").unwrap().to_string();
@@ -206,6 +213,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             destination_access_key: destination_access_key.clone(),
             destination_secret_key: destination_secret_key.clone(),
             destination_endpoint: destination_endpoint.clone(),
+            delete_destination_files,
             max_keys,
             chunk_size: multipart_upload_chunk_size,
             sync_threads,
@@ -257,6 +265,12 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             .flatten()
             .collect::<Vec<&ObjectContents>>();
 
+        let all_objects_to_delete = all_stats
+            .iter()
+            .map(|stat| &stat.objects_to_delete)
+            .flatten()
+            .collect::<Vec<&rusoto_s3::Object>>();
+
         event!(
             Level::INFO,
             "Those objects need to be sync: {:#?}",
@@ -278,6 +292,32 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
 
         event!(Level::TRACE, "Objects to sync: {:#?}", all_objects);
 
+        if delete_destination_files {
+            event!(
+                Level::INFO,
+                "Those objects will be deleted on the destination bucket because they are not on the source bucket: {:#?}",
+                all_stats
+                    .iter()
+                    .map(|stats| {
+                        stats.objects_to_delete.iter().map(|object| {
+                            format!(
+                                "{}/{} - {}",
+                                stats.bucket,
+                                object.key.as_ref().unwrap(),
+                                ByteSize(object.size.unwrap_or(0) as u64)
+                            )
+                        })
+                    })
+                    .flatten()
+                    .collect::<Vec<String>>()
+            );
+            event!(
+                Level::TRACE,
+                "Objects to delete: {:#?}",
+                all_objects_to_delete
+            );
+        }
+
         let total_sync_bytes = all_objects
             .iter()
             .fold(0, |acc, object| acc + object.get_size() as u64);
@@ -288,6 +328,19 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             all_objects.len(),
             ByteSize(total_sync_bytes)
         );
+
+        if delete_destination_files {
+            let total_delete_bytes = all_objects_to_delete
+                .iter()
+                .fold(0, |acc, object| acc + object.size.unwrap_or(0) as u64);
+
+            event!(
+                Level::INFO,
+                "Total files to delete: {} for a total of {}",
+                all_objects_to_delete.len(),
+                ByteSize(total_delete_bytes)
+            );
+        }
     }
 
     let elapsed = sync_start.elapsed();

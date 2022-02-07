@@ -18,6 +18,7 @@ pub struct BucketMigrationStats {
     pub synchronization_time: Duration,
     pub synchronization_size: usize,
     pub objects: Vec<ObjectContents>,
+    pub objects_to_delete: Vec<rusoto_s3::Object>,
 }
 
 #[derive(Debug)]
@@ -48,6 +49,7 @@ pub struct BucketMigrationConfiguration {
     pub destination_access_key: String,
     pub destination_secret_key: String,
     pub destination_endpoint: String,
+    pub delete_destination_files: bool,
     pub max_keys: usize,
     pub chunk_size: usize,
     pub sync_threads: usize,
@@ -94,41 +96,87 @@ pub async fn migrate_bucket(
     });
 
     let objects_listing_result = futures::future::join(riak_objects_fut, radosgw_objects_fut).await;
-    let mut riak_objects = objects_listing_result.0?;
+    let riak_objects = objects_listing_result.0?;
     let radosgw_objects = objects_listing_result.1?;
 
     event!(Level::DEBUG, "Riakcs objects: {}", riak_objects.len());
     event!(Level::DEBUG, "Radosgw objects: {}", radosgw_objects.len());
 
-    riak_objects.retain(|key, object| {
-        if let Some(found) = radosgw_objects.get(key) {
-            object != found
-        } else {
-            true
-        }
-    });
+    let objects_to_migrate: Vec<ObjectContents> = riak_objects
+        .iter()
+        .filter_map(|(key, object)| {
+            if let Some(found) = radosgw_objects.get(key) {
+                if object != found {
+                    Some(object.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
 
-    let objects_to_migrate: Vec<ObjectContents> = riak_objects.into_values().collect();
+    let objects_to_delete: Vec<rusoto_s3::Object> = if conf.delete_destination_files {
+        radosgw_objects
+            .iter()
+            .filter_map(|(key, object)| {
+                if riak_objects.get(key).is_none() {
+                    Some(object.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let objects_to_sync = objects_to_migrate.len() + objects_to_delete.len();
 
     if !conf.dry_run {
-        if !objects_to_migrate.is_empty() {
+        if objects_to_sync > 0 {
             let mut uploader = Uploader::new(
                 riak_client,
                 radosgw_client,
                 objects_to_migrate.clone(),
+                objects_to_delete.clone(),
                 conf.sync_threads,
                 conf.chunk_size,
             );
             let results = uploader.sync().await;
-            let results_errors: Vec<&Result<ObjectContents, anyhow::Error>> = results
+            let results_errors: Vec<String> = results
                 .iter()
                 .flat_map(|join_result| {
-                    join_result
-                        .as_ref()
-                        .unwrap()
+                    let thread_results = join_result.as_ref().unwrap();
+
+                    let sync_errors = thread_results
+                        .sync_results
                         .iter()
-                        .filter(|&result| result.is_err())
-                        .collect::<Vec<&Result<ObjectContents, anyhow::Error>>>()
+                        .filter_map(|result| {
+                            result.as_ref().err().map(|error| {
+                                format!(
+                                    "{} | Error synchronizing file: {:?}",
+                                    conf.source_bucket, error
+                                )
+                            })
+                        })
+                        .collect::<Vec<String>>();
+
+                    let delete_errors = thread_results
+                        .delete_results
+                        .iter()
+                        .filter_map(|result| {
+                            result.as_ref().err().map(|error| {
+                                format!(
+                                    "{} | Error deleting file on destination bucket: {:?}",
+                                    conf.source_bucket, error
+                                )
+                            })
+                        })
+                        .collect::<Vec<String>>();
+
+                    [&sync_errors[..], &delete_errors[..]].concat()
                 })
                 .collect();
 
@@ -142,6 +190,7 @@ pub async fn migrate_bucket(
                             join_result
                                 .as_ref()
                                 .unwrap()
+                                .sync_results
                                 .iter()
                                 .filter(|result| result.is_ok())
                                 .map(|result| result.as_ref().unwrap())
@@ -149,15 +198,11 @@ pub async fn migrate_bucket(
                         })
                         .fold(0, |acc, object| acc + object.get_size() as usize),
                     objects: objects_to_migrate,
+                    objects_to_delete,
                 };
 
                 Err(anyhow::Error::new(BucketMigrationError {
-                    errors: results_errors
-                        .iter()
-                        .map(|e| {
-                            format!("{} | Error synchronizing file: {:?}", conf.source_bucket, e)
-                        })
-                        .collect(),
+                    errors: results_errors,
                     stats,
                 }))
             } else {
@@ -168,6 +213,7 @@ pub async fn migrate_bucket(
                         .iter()
                         .fold(0, |acc, obj| acc + obj.get_size() as usize),
                     objects: objects_to_migrate,
+                    objects_to_delete,
                 })
             }
         } else {
@@ -181,6 +227,7 @@ pub async fn migrate_bucket(
                 synchronization_time: sync_start.elapsed(),
                 synchronization_size: 0,
                 objects: objects_to_migrate,
+                objects_to_delete,
             })
         }
     } else {
@@ -189,6 +236,7 @@ pub async fn migrate_bucket(
             synchronization_time: sync_start.elapsed(),
             synchronization_size: 0,
             objects: objects_to_migrate,
+            objects_to_delete,
         })
     }
 }

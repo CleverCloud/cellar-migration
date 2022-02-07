@@ -22,11 +22,17 @@ use super::RadosGW;
 
 pub const RADOSGW_MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
 
+pub struct ThreadMigrationResult {
+    pub sync_results: Vec<anyhow::Result<ObjectContents>>,
+    pub delete_results: Vec<anyhow::Result<rusoto_s3::Object>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Uploader {
     riak_client: RiakCS,
     radosgw_client: RadosGW,
     objects: Arc<Mutex<VecDeque<ObjectContents>>>,
+    objects_to_delete: Arc<Mutex<VecDeque<rusoto_s3::Object>>>,
     threads: usize,
     multipart_chunk_size: usize,
 }
@@ -36,15 +42,16 @@ impl Uploader {
         riak_client: RiakCS,
         radosgw_client: RadosGW,
         objects: Vec<ObjectContents>,
+        objects_to_delete: Vec<rusoto_s3::Object>,
         threads: usize,
         multipart_chunk_size: usize,
     ) -> Uploader {
-        let objects_len = objects.len();
-        if objects_len < threads {
+        let sync_len = objects.len() + objects_to_delete.len();
+        if sync_len < threads {
             event!(
                 Level::WARN,
                 "There are more threads than files to synchronize. I'll only start {} threads",
-                objects_len
+                sync_len
             );
         }
 
@@ -52,23 +59,27 @@ impl Uploader {
             riak_client,
             radosgw_client,
             objects: Arc::new(Mutex::new(VecDeque::from(objects))),
-            threads: std::cmp::min(threads, objects_len),
+            objects_to_delete: Arc::new(Mutex::new(VecDeque::from(objects_to_delete))),
+            threads: std::cmp::min(threads, sync_len),
             multipart_chunk_size,
         }
     }
 
-    pub async fn sync(&mut self) -> Vec<Result<Vec<anyhow::Result<ObjectContents>>, JoinError>> {
+    pub async fn sync(&mut self) -> Vec<Result<ThreadMigrationResult, JoinError>> {
         event!(Level::INFO, "Starting {} sync threads", self.threads);
         let mut handles = Vec::new();
         let total_files = self.objects.clone().lock().unwrap().len();
+        let total_files_to_delete = self.objects_to_delete.clone().lock().unwrap().len();
 
         for thread_id in 0..self.threads {
             let riak_client = self.riak_client.clone();
             let radosgw_client = self.radosgw_client.clone();
             let files = self.objects.clone();
+            let files_to_delete = self.objects_to_delete.clone();
             let multipart_chunk_size = self.multipart_chunk_size;
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
+                let mut delete_results = Vec::new();
                 loop {
                     let (object, remaining) = {
                         let mut files = files.lock().unwrap();
@@ -99,16 +110,46 @@ impl Uploader {
 
                         results.push(result);
                     } else {
-                        event!(
-                            Level::INFO,
-                            "Thread {} | No more objects to synchronize, quitting..",
-                            thread_id
-                        );
-                        break;
+                        let (object_to_delete, remaining) = {
+                            let mut files = files_to_delete.lock().unwrap();
+                            let object = files.pop_front();
+                            let remaining = files.len();
+                            (object, remaining)
+                        };
+
+                        if let Some(object_to_delete) = object_to_delete {
+                            event!(
+                                Level::INFO,
+                                "Thread {} | ({}/{}) Deleting object {} on destination bucket",
+                                thread_id,
+                                total_files_to_delete - remaining,
+                                total_files_to_delete,
+                                object_to_delete.key.as_ref().unwrap()
+                            );
+
+                            let result = Uploader::delete_destination_object(
+                                &radosgw_client,
+                                object_to_delete,
+                                thread_id,
+                            )
+                            .await;
+
+                            delete_results.push(result);
+                        } else {
+                            event!(
+                                Level::INFO,
+                                "Thread {} | No more objects to synchronize, quitting..",
+                                thread_id
+                            );
+                            break;
+                        }
                     }
                 }
 
-                results
+                ThreadMigrationResult {
+                    sync_results: results,
+                    delete_results,
+                }
             });
 
             handles.push(handle);
@@ -344,6 +385,24 @@ impl Uploader {
         );
 
         Ok(())
+    }
+
+    pub async fn delete_destination_object(
+        radosgw_client: &RadosGW,
+        object: rusoto_s3::Object,
+        thread_id: usize,
+    ) -> anyhow::Result<rusoto_s3::Object> {
+        event!(
+            Level::DEBUG,
+            "Thread {} | Delete object {}",
+            thread_id,
+            object.key.as_ref().unwrap()
+        );
+
+        radosgw_client
+            .delete_object(object)
+            .await
+            .map_err(|err| anyhow::anyhow!(err))
     }
 }
 

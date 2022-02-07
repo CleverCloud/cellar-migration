@@ -112,7 +112,7 @@ pub async fn migrate_bucket(
                     None
                 }
             } else {
-                None
+                Some(object.clone())
             }
         })
         .collect();

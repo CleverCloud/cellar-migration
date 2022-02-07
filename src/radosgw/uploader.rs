@@ -14,13 +14,11 @@ use tracing::event;
 use tracing::Level;
 
 use crate::riakcs::{
-    dto::{get_part_size_from_etag, ObjectContents, ObjectMetadataResponse},
+    dto::{ObjectContents, ObjectMetadataResponse},
     RiakCS,
 };
 
 use super::RadosGW;
-
-pub const RADOSGW_MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
 
 pub struct ThreadMigrationResult {
     pub sync_results: Vec<anyhow::Result<ObjectContents>>,
@@ -170,35 +168,8 @@ impl Uploader {
         if response.status().is_success() {
             let start = std::time::Instant::now();
             let object_size = object.get_size() as usize;
-            let force_multipart_upload = if object_metadata.metadata.etag_has_parts() {
-                let part_size = get_part_size_from_etag(
-                    object_metadata.metadata.etag.as_ref().unwrap(),
-                    object_size,
-                );
 
-                if part_size >= RADOSGW_MIN_PART_SIZE {
-                    Some(part_size)
-                } else {
-                    event!(Level::WARN, "Object {} has been initially uploaded using multipart upload with parts less than 5MB. A different part size will be used if needed.", object.get_key());
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(part_size) = force_multipart_upload {
-                let body =
-                    RiakResponseStreamChunk::new(RiakResponseStream::new(response), part_size);
-                Uploader::sync_object_multipart(
-                    radosgw_client,
-                    object,
-                    &object_metadata,
-                    body,
-                    part_size,
-                    thread_id,
-                )
-                .await?;
-            } else if object_size < multipart_chunk_size {
+            if object_size < multipart_chunk_size {
                 let body = ByteStream::new(RiakResponseStream::new(response));
                 Uploader::sync_object_singlepart(
                     radosgw_client,

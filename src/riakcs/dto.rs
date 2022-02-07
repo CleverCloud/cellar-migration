@@ -90,6 +90,17 @@ impl PartialEq<rusoto_s3::Object> for ObjectContents {
                 } else {
                     false
                 }
+            } else if other.e_tag.as_ref().unwrap_or(&String::new()).contains('-') {
+                event!(Level::WARN, "Object {} has been uploaded without multipart on source bucket but with multipart on destination bucket. Falling back to last modification date to compare objects.", self.get_key());
+                let other_date: Option<DateTime<Utc>> = other
+                    .last_modified
+                    .as_ref()
+                    .and_then(|date| DateTime::from_str(date).ok());
+                if let Some(other_date) = other_date {
+                    self.get_last_modified() < other_date
+                } else {
+                    false
+                }
             } else {
                 false
             }

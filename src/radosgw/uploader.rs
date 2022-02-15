@@ -250,7 +250,11 @@ impl Uploader {
                 );
                 Ok(())
             }
-            Err(error) => Err(anyhow::Error::from(error)),
+            Err(error) => Err(anyhow::anyhow!(format!(
+                "Failed to put object {}: {:?}",
+                object.get_key(),
+                error
+            ))),
         }
     }
 
@@ -319,7 +323,12 @@ impl Uploader {
                     radosgw_client
                         .abort_multipart_upload(object.get_key(), multipart_upload_id)
                         .await?;
-                    return Err(anyhow::Error::from(error));
+
+                    return Err(anyhow::anyhow!(format!(
+                        "Failed to put object {}: {:?}",
+                        object.get_key(),
+                        error
+                    )));
                 }
             }
         }

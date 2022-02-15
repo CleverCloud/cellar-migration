@@ -10,6 +10,7 @@ use hyper::{body::HttpBody, Body, Client, Method, Response};
 use hyper_tls::HttpsConnector;
 use ring::hmac;
 use serde::Deserialize;
+use serde_xml_rs::{de::Deserializer, ParserConfig};
 use tracing::{event, instrument, Level};
 
 use crate::riakcs::dto::ListBucketsResult;
@@ -169,8 +170,12 @@ impl RiakCS {
         let data_str = String::from_utf8_lossy(&body[..]);
         event!(Level::TRACE, "{}", data_str);
 
+        let reader = ParserConfig::default()
+            .trim_whitespace(false)
+            .create_reader(data_str.as_bytes());
         if response.status().is_success() {
-            Ok(serde_xml_rs::from_str(&data_str)?)
+            let deser = T::deserialize(&mut Deserializer::new(reader))?;
+            Ok(deser)
         } else {
             Err(anyhow::Error::from(RiakCSError::new(
                 uri,

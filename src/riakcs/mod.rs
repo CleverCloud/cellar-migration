@@ -212,14 +212,17 @@ impl RiakCS {
     }
 
     #[instrument(skip(self), level = "debug")]
-    pub async fn list_objects(&self, max_keys: usize) -> Result<HashMap<String, ObjectContents>> {
+    pub async fn list_objects(
+        &self,
+        max_keys: Option<usize>,
+    ) -> Result<HashMap<String, ObjectContents>> {
         let mut results = HashMap::new();
         let mut marker: Option<String> = None;
         loop {
             let uri = format!(
                 "{}?max-keys={}{}",
                 self.get_uri(),
-                max_keys,
+                std::cmp::max(max_keys.unwrap_or(1000), 1000),
                 marker
                     .take()
                     .map(|m| format!("&marker={}", urlencoding::encode(&m)))
@@ -389,7 +392,7 @@ impl Provider for RiakCS {
         Ok(buckets)
     }
 
-    async fn list_objects(&self, max_keys: usize) -> Result<ProviderObjects> {
+    async fn list_objects(&self, max_keys: Option<usize>) -> Result<ProviderObjects> {
         self.list_objects(max_keys).await.map(|objects| {
             objects
                 .iter()

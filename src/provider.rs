@@ -258,7 +258,7 @@ impl dyn ProviderResponse {
 #[async_trait]
 pub trait Provider: Debug + DynClone + Send + Sync {
     async fn get_buckets(&self) -> anyhow::Result<Vec<String>>;
-    async fn list_objects(&self, max_keys: usize) -> anyhow::Result<ProviderObjects>;
+    async fn list_objects(&self, max_keys: Option<usize>) -> anyhow::Result<ProviderObjects>;
     async fn get_object_metadata(
         &self,
         object: &ProviderObject,

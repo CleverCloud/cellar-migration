@@ -82,7 +82,7 @@ pub async fn migrate_bucket(
         Some(conf.destination_bucket),
     );
 
-    let source_objects_fut = source_provider.list_objects(conf.max_keys);
+    let source_objects_fut = source_provider.list_objects(None);
     let radosgw_objects_fut = radosgw_client.list_objects(None).or_else(|error| {
         async move {
             match error.downcast::<RusotoError<_>>() {
@@ -104,8 +104,12 @@ pub async fn migrate_bucket(
     let source_objects = objects_listing_result.0?;
     let radosgw_objects = objects_listing_result.1?;
 
-    event!(Level::DEBUG, "Riakcs objects: {}", source_objects.len());
-    event!(Level::DEBUG, "Radosgw objects: {}", radosgw_objects.len());
+    event!(Level::DEBUG, "Source objects: {}", source_objects.len());
+    event!(
+        Level::DEBUG,
+        "Destination objects: {}",
+        radosgw_objects.len()
+    );
 
     let objects_to_migrate: Vec<ProviderObject> = source_objects
         .iter()

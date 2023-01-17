@@ -237,7 +237,7 @@ impl RadosGW {
     #[instrument(skip(self), level = "trace")]
     pub async fn list_objects(
         &self,
-        max_results: Option<i64>,
+        max_results: Option<usize>,
     ) -> anyhow::Result<HashMap<String, rusoto_s3::Object>> {
         let mut results = HashMap::new();
         let mut start_after = None;
@@ -250,7 +250,7 @@ impl RadosGW {
                     .clone()
                     .expect("list_objects should have a bucket"),
                 start_after,
-                max_keys: max_results.map(|max| std::cmp::min(max, 1000)),
+                max_keys: max_results.map(|max| std::cmp::min(max, 1000) as i64),
                 ..Default::default()
             };
 
@@ -278,7 +278,7 @@ impl RadosGW {
             }
 
             if let Some(max_results) = max_results {
-                if total_keys >= max_results {
+                if total_keys >= max_results as i64 {
                     break;
                 }
             }
@@ -483,15 +483,13 @@ impl Provider for RadosGW {
                 .collect()
         })
     }
-    async fn list_objects(&self, max_keys: usize) -> anyhow::Result<ProviderObjects> {
-        self.list_objects(Some(max_keys as i64))
-            .await
-            .map(|result| {
-                result
-                    .iter()
-                    .map(|(key, object)| (key.clone(), object.into()))
-                    .collect()
-            })
+    async fn list_objects(&self, max_keys: Option<usize>) -> anyhow::Result<ProviderObjects> {
+        self.list_objects(max_keys).await.map(|result| {
+            result
+                .iter()
+                .map(|(key, object)| (key.clone(), object.into()))
+                .collect()
+        })
     }
     async fn get_object_metadata(
         &self,

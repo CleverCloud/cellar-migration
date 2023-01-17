@@ -16,8 +16,8 @@ use rusoto_s3::{
     CompletedMultipartUpload, CompletedPart, CreateBucketError, CreateBucketRequest,
     CreateMultipartUploadError, CreateMultipartUploadOutput, CreateMultipartUploadRequest,
     DeleteObjectError, DeleteObjectRequest, GetObjectError, GetObjectOutput, GetObjectRequest,
-    HeadObjectOutput, HeadObjectRequest, ListBucketsError, ListObjectsV2Request, Object,
-    PutObjectError, PutObjectOutput, PutObjectRequest, S3Client, UploadPartError, UploadPartOutput,
+    HeadObjectOutput, HeadObjectRequest, ListObjectsV2Request, Object, PutObjectError,
+    PutObjectOutput, PutObjectRequest, S3Client, UploadPartError, UploadPartOutput,
     UploadPartRequest, S3,
 };
 use tracing::{event, instrument, Level};
@@ -295,11 +295,12 @@ impl RadosGW {
     }
 
     #[instrument(skip(self), level = "debug")]
-    pub async fn list_buckets(&self) -> Result<Vec<Bucket>, RusotoError<ListBucketsError>> {
+    pub async fn list_buckets(&self) -> anyhow::Result<Vec<Bucket>> {
         let client = self.get_client();
         client
             .list_buckets()
             .await
+            .map_err(|err| anyhow::Error::from(err))
             .map(|result| result.buckets.unwrap_or_default())
     }
 
@@ -461,7 +462,12 @@ impl ProviderResponse for RadosGWResponse {
 #[async_trait]
 impl Provider for RadosGW {
     async fn get_buckets(&self) -> anyhow::Result<Vec<String>> {
-        todo!()
+        self.list_buckets().await.map(|buckets| {
+            buckets
+                .iter()
+                .map(|b| b.name.clone().expect("Bucket should have a name"))
+                .collect()
+        })
     }
     async fn list_objects(&self, max_keys: usize) -> anyhow::Result<ProviderObjects> {
         self.list_objects(Some(max_keys as i64))

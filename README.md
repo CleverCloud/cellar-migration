@@ -31,6 +31,7 @@ To migrate a bucket, you'll want to use the `migrate` command. You'll have some 
 - `--source-bucket`
 - `--source-endpoint`
 - `--source-provider`
+- `--source-region`
 - `--destination-access-key`
 - `--destination-secret-key`
 - `--destination-bucket`

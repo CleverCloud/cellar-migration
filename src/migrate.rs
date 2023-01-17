@@ -2,7 +2,7 @@ use std::{collections::HashMap, error};
 
 use futures::TryFutureExt;
 
-use rusoto_core::RusotoError;
+use rusoto_core::{Region, RusotoError};
 use rusoto_s3::{CreateBucketError, ListObjectsV2Error};
 use std::time::Duration;
 use tracing::{event, instrument, Level};
@@ -44,7 +44,8 @@ pub struct BucketMigrationConfiguration {
     pub source_bucket: String,
     pub source_access_key: String,
     pub source_secret_key: String,
-    pub source_endpoint: String,
+    pub source_endpoint: Option<String>,
+    pub source_region: Option<String>,
     pub source_provider: String,
     pub destination_bucket: String,
     pub destination_access_key: String,
@@ -65,6 +66,7 @@ pub async fn migrate_bucket(
 
     let source_provider_conf = ProviderConf::new(
         conf.source_endpoint,
+        conf.source_region,
         conf.source_access_key,
         conf.source_secret_key,
         Some(conf.source_bucket.clone()),
@@ -73,7 +75,8 @@ pub async fn migrate_bucket(
     let source_provider = get_provider(&conf.source_provider, source_provider_conf);
 
     let radosgw_client = RadosGW::new(
-        conf.destination_endpoint,
+        Some(conf.destination_endpoint),
+        None,
         conf.destination_access_key,
         conf.destination_secret_key,
         Some(conf.destination_bucket),
@@ -254,7 +257,8 @@ pub async fn create_destination_buckets(
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let client = RadosGW::new(
-        destination_endpoint.clone(),
+        Some(destination_endpoint.clone()),
+        None,
         destination_access_key.clone(),
         destination_secret_key.clone(),
         None,
@@ -291,7 +295,8 @@ pub async fn create_destination_buckets(
             // To know if the bucket already exists on another add-on, we can try to list its files. If it's not created, we will receive a NoSuchBucket error
             // If it is, we will receive another error
             let client_dry_run = RadosGW::new(
-                destination_endpoint.clone(),
+                Some(destination_endpoint.clone()),
+                None,
                 destination_access_key.clone(),
                 destination_secret_key.clone(),
                 Some(destination_bucket.clone()),

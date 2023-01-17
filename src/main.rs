@@ -3,10 +3,13 @@ mod provider;
 mod radosgw;
 mod riakcs;
 
+use std::str::FromStr;
+
 use bytesize::ByteSize;
 use clap::{value_parser, ArgAction};
 use clap::{Arg, ArgMatches, Command};
 use migrate::BucketMigrationConfiguration;
+use rusoto_core::Region;
 use tracing::event;
 use tracing::instrument;
 use tracing::Level;
@@ -38,8 +41,9 @@ async fn main() -> anyhow::Result<()> {
             .arg(Arg::new("source-bucket").long("source-bucket").help("Source bucket from which files will be copied. If omitted, all buckets of the add-on will be synchronized"))
             .arg(Arg::new("source-access-key").long("source-access-key").help("Source bucket Cellar access key").required(true))
             .arg(Arg::new("source-secret-key").long("source-secret-key").help("Source bucket Cellar secret key").required(true))
-            .arg(Arg::new("source-endpoint").long("source-endpoint").help("Source endpoint of the S3 Bucket").required(true))
+            .arg(Arg::new("source-endpoint").long("source-endpoint").help("Source endpoint of the S3 Bucket"))
             .arg(Arg::new("source-provider").long("source-provider").help("Provider for source bucket (AWS, Ceph, RiakCS, ..)").required(true))
+            .arg(Arg::new("source-region").long("source-region").help("Region of the source bucket (eu-west-1,..)"))
             .arg(Arg::new("destination-bucket").long("destination-bucket").help("Destination bucket to which the files will be copied. If omitted, the bucket will be created if it doesn't exist"))
             .arg(Arg::new("destination-bucket-prefix").long("destination-bucket-prefix").help("Prefix to apply to the destination bucket name"))
             .arg(Arg::new("destination-access-key").long("destination-access-key").help("Destination bucket Cellar access key").required(true))
@@ -115,8 +119,10 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         .to_string();
     let source_endpoint = params
         .get_one::<String>("source-endpoint")
-        .unwrap()
-        .to_string();
+        .map(|s| s.to_owned());
+    let source_region = params
+        .get_one::<String>("source-region")
+        .map(|s| s.to_owned());
 
     let source_provider_str = params
         .get_one::<String>("source-provider")
@@ -148,10 +154,40 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    match (&source_endpoint, &source_region) {
+        (None, None) => {
+            event!(
+                Level::ERROR,
+                "You have to define either --source-endpoint or --source-region"
+            );
+            std::process::exit(1);
+        }
+        (None, Some(region)) => {
+            if Region::from_str(region).is_err() {
+                event!(
+                    Level::ERROR,
+                    "Failed to parse given region to --source-region"
+                );
+                std::process::exit(1);
+            }
+        }
+        (Some(_), None) => {
+            if source_provider_str == "aws-s3" {
+                event!(
+                    Level::ERROR,
+                    "For source-provider aws-s3, you need to specify --source-region as well"
+                );
+                std::process::exit(1);
+            }
+        }
+        _ => {}
+    };
+
     let sync_start = std::time::Instant::now();
 
     let source_provider_conf = ProviderConf::new(
         source_endpoint.clone(),
+        source_region.clone(),
         source_access_key.clone(),
         source_secret_key.clone(),
         None,
@@ -171,9 +207,16 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         source_provider.get_buckets().await?
     };
 
+    event!(
+        Level::INFO,
+        "Destination endpoint: {:?}, access key: {:?}, secret key: {:?}",
+        destination_endpoint,
+        destination_access_key,
+        destination_secret_key
+    );
     // First make sure the destination buckets exist / can be created
     // If not, exit now
-    if migrate::create_destination_buckets(
+    if let Err(error) = migrate::create_destination_buckets(
         destination_endpoint.clone(),
         destination_access_key.clone(),
         destination_secret_key.clone(),
@@ -183,11 +226,11 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         dry_run,
     )
     .await
-    .is_err()
     {
         event!(
             Level::ERROR,
-            "Error while creating destination buckets. Aborting now."
+            "Error while creating destination buckets. Error = {:?}. Aborting now.",
+            error
         );
         std::process::exit(1);
     }
@@ -233,6 +276,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             source_access_key: source_access_key.clone(),
             source_secret_key: source_secret_key.clone(),
             source_endpoint: source_endpoint.clone(),
+            source_region: source_region.clone(),
             source_provider: source_provider_str.to_string(),
             destination_bucket: format!("{}{}", destination_bucket_prefix, destination_bucket),
             destination_access_key: destination_access_key.clone(),

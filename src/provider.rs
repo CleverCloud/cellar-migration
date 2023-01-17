@@ -12,6 +12,7 @@ use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, FixedOffset, Utc};
 use dyn_clone::DynClone;
 use futures::{Stream, StreamExt};
+use rusoto_core::Region;
 use tracing::{event, instrument, Level};
 
 use crate::{
@@ -23,7 +24,8 @@ use crate::{
 };
 
 pub struct ProviderConf {
-    pub endpoint: String,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
     pub access_key: String,
     pub secret_key: String,
     pub bucket: Option<String>,
@@ -31,13 +33,15 @@ pub struct ProviderConf {
 
 impl ProviderConf {
     pub fn new(
-        endpoint: String,
+        endpoint: Option<String>,
+        region: Option<String>,
         access_key: String,
         secret_key: String,
         bucket: Option<String>,
     ) -> ProviderConf {
         ProviderConf {
             endpoint,
+            region,
             access_key,
             secret_key,
             bucket,
@@ -270,13 +274,22 @@ dyn_clone::clone_trait_object!(Provider);
 pub fn get_provider(provider: &str, conf: ProviderConf) -> Box<dyn Provider> {
     match provider {
         "riak-cs" => Box::new(RiakCS::new(
-            conf.endpoint,
+            conf.endpoint
+                .expect("RiakCS requires an endpoint and not a region"),
             conf.access_key,
             conf.secret_key,
             conf.bucket,
         )),
-        "cellar" | "aws-s3" => Box::new(RadosGW::new(
+        "cellar" => Box::new(RadosGW::new(
             conf.endpoint,
+            None,
+            conf.access_key,
+            conf.secret_key,
+            conf.bucket,
+        )),
+        "aws-s3" => Box::new(RadosGW::new(
+            None,
+            conf.region,
             conf.access_key,
             conf.secret_key,
             conf.bucket,

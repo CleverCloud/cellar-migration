@@ -3,13 +3,14 @@ pub mod uploader;
 
 use std::{
     collections::HashMap,
+    str::FromStr,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use rusoto_core::{ByteStream, RusotoError};
+use rusoto_core::{ByteStream, Region, RusotoError};
 use rusoto_s3::{
     AbortMultipartUploadError, AbortMultipartUploadOutput, AbortMultipartUploadRequest, Bucket,
     CompleteMultipartUploadError, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
@@ -29,7 +30,8 @@ use crate::provider::{
 
 #[derive(Debug, Clone)]
 pub struct RadosGW {
-    endpoint: String,
+    endpoint: Option<String>,
+    region: Option<String>,
     access_key: String,
     secret_key: String,
     bucket: Option<String>,
@@ -37,13 +39,15 @@ pub struct RadosGW {
 
 impl RadosGW {
     pub fn new(
-        endpoint: String,
+        endpoint: Option<String>,
+        region: Option<String>,
         access_key: String,
         secret_key: String,
         bucket: Option<String>,
     ) -> RadosGW {
         RadosGW {
             endpoint,
+            region,
             access_key,
             secret_key,
             bucket,
@@ -57,15 +61,25 @@ impl RadosGW {
             self.secret_key.clone(),
         );
         let http_client = rusoto_core::HttpClient::new().unwrap();
-
-        S3Client::new_with(
-            http_client,
-            radosgw_credential_provider,
-            rusoto_core::Region::Custom {
-                name: "RadosGW".to_string(),
-                endpoint: self.endpoint.clone(),
+        let region = match (&self.endpoint, &self.region) {
+            // Can happen for other S3 like services
+            (Some(endpoint), Some(region)) => rusoto_core::Region::Custom {
+                name: region.clone(),
+                endpoint: endpoint.clone(),
             },
-        )
+            (Some(endpoint), None) => rusoto_core::Region::Custom {
+                name: "default".to_string(),
+                endpoint: endpoint.clone(),
+            },
+            (None, Some(region)) => {
+                rusoto_core::Region::from_str(region).expect("Region should be valid")
+            }
+            _ => unreachable!(),
+        };
+
+        event!(Level::DEBUG, "Using client with region: {:?}", region);
+
+        S3Client::new_with(http_client, radosgw_credential_provider, region)
     }
 
     #[instrument(skip(self), level = "debug")]

@@ -4,6 +4,7 @@ mod radosgw;
 mod riakcs;
 
 use bytesize::ByteSize;
+use clap::{value_parser, ArgAction};
 use clap::{Arg, ArgMatches, Command};
 use migrate::BucketMigrationConfiguration;
 use tracing::event;
@@ -49,27 +50,27 @@ async fn main() -> anyhow::Result<()> {
             )
             .arg(
                 Arg::new("threads").long("threads").short('t').help("Number of threads used to synchronize this bucket")
-                .required(false)
+                .required(false).value_parser(value_parser!(usize))
             )
             .arg(
                 Arg::new("multipart-chunk-size-mb").long("multipart-chunk-size-mb")
                 .help("Size of each chunk of multipart upload in Megabytes. Files bigger than this size are automatically uploaded using multipart upload")
-                .required(false).default_value("100")
+                .required(false).value_parser(value_parser!(usize)).default_value("100")
             )
             .arg(
                 Arg::new("execute").long("execute").short('e')
                 .help("Execute the synchronization. THIS COMMAND WILL MAKE PRODUCTION CHANGES TO THE DESTINATION BUCKET.")
-                .required(false).num_args(0)
+                .action(ArgAction::SetTrue)
             )
             .arg(
                 Arg::new("max-keys").long("max-keys").short('m')
                 .help("Define the maximum number of object keys to list when listing the bucket. Lowering this might help listing huge buckets")
-                .required(false).default_value("1000")
+                .required(false).value_parser(value_parser!(usize)).default_value("1000")
             )
             .arg(
                 Arg::new("delete").long("delete").short('d')
                 .help("Delete extraneous files from destination bucket")
-                .required(false).num_args(0)
+                .action(ArgAction::SetTrue)
             )
         )
         .get_matches();
@@ -82,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[instrument(skip_all, level = "debug")]
 async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
-    let dry_run = params.value_source("execute").is_some();
+    let dry_run = params.get_one::<bool>("execute") == Some(&false);
 
     if dry_run {
         event!(Level::WARN, "Running in dry run mode. No changes will be made. If you want to synchronize for real, use --execute");
@@ -100,7 +101,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         .get_one("max-keys")
         .expect("max-keys should be a usize");
 
-    let delete_destination_files = params.value_source("delete").is_some();
+    let delete_destination_files = params.get_one::<bool>("delete") == Some(&true);
 
     let source_bucket: Option<String> = params
         .get_one("source-bucket")

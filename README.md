@@ -29,6 +29,8 @@ To migrate a bucket, you'll want to use the `migrate` command. You'll have some 
 - `--source-access-key`
 - `--source-secret-key`
 - `--source-bucket`
+- `--source-endpoint`
+- `--source-provider`
 - `--destination-access-key`
 - `--destination-secret-key`
 - `--destination-bucket`
@@ -73,6 +75,8 @@ main() {
 
     cellar-migration migrate \
       --source-bucket "${bucket}" \
+      --source-endpoint "cellar-c2.services.clever-cloud.com"
+      --source-provider "cellar"
       --destination-bucket "${destination_bucket}" \
       --source-access-key "<source_key>" \
       --source-secret-key "<source_secret>" \

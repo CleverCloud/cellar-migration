@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::Engine;
 use bytes::{BufMut, BytesMut};
 use chrono::{DateTime, Duration, Utc};
 use dto::{ListObjectResponse, ObjectContents};
@@ -90,7 +91,7 @@ impl RiakCS {
         event!(Level::TRACE, "to sign: {:#?}", to_sign);
         let computed_hash = hmac::sign(&key, to_sign.as_bytes());
         event!(Level::TRACE, "{:x?}", computed_hash.as_ref());
-        base64::encode(computed_hash.as_ref())
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(computed_hash.as_ref())
     }
 
     fn sign_request(&self, req: &mut hyper::Request<Body>) {

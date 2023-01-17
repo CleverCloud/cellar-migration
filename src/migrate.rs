@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::{event, instrument, Level};
 
 use crate::{
-    provider::{get_provider, Provider, ProviderConf, ProviderObject},
+    provider::{get_provider, ProviderConf, ProviderObject},
     radosgw::{uploader::Uploader, RadosGW},
 };
 
@@ -82,15 +82,16 @@ pub async fn migrate_bucket(
     let source_objects_fut = source_provider.list_objects(conf.max_keys);
     let radosgw_objects_fut = radosgw_client.list_objects(None).or_else(|error| {
         async move {
-            match error {
-                RusotoError::Service(ListObjectsV2Error::NoSuchBucket(bucket)) => {
+            match error.downcast::<RusotoError<_>>() {
+                Ok(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(bucket))) => {
                     if conf.dry_run {
                         Ok(HashMap::new())
                     } else {
                         Err(anyhow::anyhow!("Unexpected error: Destination bucket {} doesn't exist but we tried to list its files", bucket))
                     }
                 }
-                e => Err(anyhow::Error::from(e))
+                Ok(e) => Err(anyhow::Error::from(e)),
+                Err(downcast) => unreachable!("Failed to downcast error: {:?}", downcast)
             }
         }
     });
@@ -138,7 +139,7 @@ pub async fn migrate_bucket(
     if !conf.dry_run {
         if objects_to_sync > 0 {
             let mut uploader = Uploader::new(
-                Box::new(source_provider),
+                source_provider,
                 radosgw_client,
                 objects_to_migrate.clone(),
                 objects_to_delete.clone(),
@@ -298,13 +299,18 @@ pub async fn create_destination_buckets(
 
             match client_dry_run.list_objects(Some(1)).await {
                 Ok(_) => {}
-                Err(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
-                    event!(Level::INFO, "DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
-                }
-                Err(e) => {
-                    bucket_already_created(&destination_bucket);
-                    return Err(anyhow::Error::from(e));
-                }
+                Err(error) => match error.downcast::<RusotoError<_>>() {
+                    Ok(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
+                        event!(Level::INFO, "DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
+                    }
+                    Ok(e) => {
+                        bucket_already_created(&destination_bucket);
+                        return Err(anyhow::Error::from(e));
+                    }
+                    Err(downcast) => {
+                        panic!("Failed to downcast error to a RusotoError: {:?}", downcast)
+                    }
+                },
             }
         } else {
             event!(

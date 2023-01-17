@@ -15,7 +15,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::migrate::{BucketMigrationError, BucketMigrationStats};
 use crate::provider::get_provider;
-use crate::provider::Provider;
 use crate::provider::ProviderConf;
 use crate::provider::ProviderObject;
 

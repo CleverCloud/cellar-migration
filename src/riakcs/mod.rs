@@ -18,8 +18,9 @@ use tracing::{event, instrument, Level};
 use crate::{
     provider::{
         Provider, ProviderObject, ProviderObjectMetadata, ProviderObjects, ProviderResponse,
+        ProviderResponseStreamChunk,
     },
-    radosgw::uploader::{RiakResponseStream, RiakResponseStreamChunk},
+    radosgw::uploader::RiakResponseStream,
     riakcs::dto::ListBucketsResult,
 };
 
@@ -454,8 +455,10 @@ impl ProviderResponse for RiakCSResponse {
     ) -> std::pin::Pin<
         Box<dyn futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>> + Send>,
     > {
-        Box::pin(RiakResponseStreamChunk::new(
-            RiakResponseStream::new(self.response.take().expect("We should have a response")),
+        Box::pin(ProviderResponseStreamChunk::new(
+            Box::pin(RiakResponseStream::new(
+                self.response.take().expect("We should have a response"),
+            )),
             chunk_size,
         ))
     }

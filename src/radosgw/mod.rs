@@ -1,21 +1,31 @@
 pub mod awscredentials;
 pub mod uploader;
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use rusoto_core::{ByteStream, RusotoError};
 use rusoto_s3::{
     AbortMultipartUploadError, AbortMultipartUploadOutput, AbortMultipartUploadRequest, Bucket,
     CompleteMultipartUploadError, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
     CompletedMultipartUpload, CompletedPart, CreateBucketError, CreateBucketRequest,
     CreateMultipartUploadError, CreateMultipartUploadOutput, CreateMultipartUploadRequest,
-    DeleteObjectError, DeleteObjectRequest, ListBucketsError, ListObjectsV2Error,
-    ListObjectsV2Request, Object, PutObjectError, PutObjectOutput, PutObjectRequest, S3Client,
-    UploadPartError, UploadPartOutput, UploadPartRequest, S3,
+    DeleteObjectError, DeleteObjectRequest, GetObjectError, GetObjectOutput, GetObjectRequest,
+    HeadObjectOutput, HeadObjectRequest, ListBucketsError, ListObjectsV2Request, Object,
+    PutObjectError, PutObjectOutput, PutObjectRequest, S3Client, UploadPartError, UploadPartOutput,
+    UploadPartRequest, S3,
 };
 use tracing::{event, instrument, Level};
 
-use crate::provider::ProviderObjectMetadata;
+use crate::provider::{
+    Provider, ProviderObject, ProviderObjectMetadata, ProviderObjects, ProviderResponse,
+    ProviderResponseStreamChunk,
+};
 
 #[derive(Debug, Clone)]
 pub struct RadosGW {
@@ -214,7 +224,7 @@ impl RadosGW {
     pub async fn list_objects(
         &self,
         max_results: Option<i64>,
-    ) -> Result<HashMap<String, rusoto_s3::Object>, RusotoError<ListObjectsV2Error>> {
+    ) -> anyhow::Result<HashMap<String, rusoto_s3::Object>> {
         let mut results = HashMap::new();
         let mut start_after = None;
         let mut total_keys: i64 = 0;
@@ -310,5 +320,174 @@ impl RadosGW {
             .create_bucket(create_bucket_request)
             .await
             .map(|_| ())
+    }
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_object_metadata(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<HeadObjectOutput> {
+        let client = self.get_client();
+
+        let head_object_request = HeadObjectRequest {
+            bucket: self
+                .bucket
+                .clone()
+                .expect("get_object_metadata should have a bucket"),
+            key: object.get_key(),
+            ..Default::default()
+        };
+
+        client
+            .head_object(head_object_request)
+            .await
+            .map_err(|err| anyhow::Error::from(err))
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_object(&self, object: &ProviderObject) -> anyhow::Result<GetObjectOutput> {
+        let client = self.get_client();
+
+        let get_object_request = GetObjectRequest {
+            bucket: self
+                .bucket
+                .clone()
+                .expect("get_object should have a bucket"),
+            key: object.get_key(),
+            ..Default::default()
+        };
+
+        client
+            .get_object(get_object_request)
+            .await
+            .map_err(|err| anyhow::Error::from(err))
+    }
+}
+
+struct RadosGWResponseInner {
+    stream: ByteStream,
+}
+
+impl RadosGWResponseInner {
+    pub fn new(stream: ByteStream) -> RadosGWResponseInner {
+        RadosGWResponseInner { stream }
+    }
+}
+
+impl Stream for RadosGWResponseInner {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.stream.poll_next_unpin(cx)
+    }
+}
+
+#[derive(Debug)]
+pub struct RadosGWResponse {
+    response: Option<Arc<Mutex<GetObjectOutput>>>,
+    error: Option<anyhow::Error>,
+}
+
+impl RadosGWResponse {
+    pub fn new(response: Result<GetObjectOutput, anyhow::Error>) -> RadosGWResponse {
+        let (res, error) = match response {
+            Ok(res) => (Some(Arc::new(Mutex::new(res))), None),
+            Err(err) => (None, Some(err)),
+        };
+        RadosGWResponse {
+            response: res,
+            error: error,
+        }
+    }
+}
+
+impl ProviderResponse for RadosGWResponse {
+    fn status(&self) -> u16 {
+        match &self.error {
+            None => 200,
+            Some(err) => match err.downcast_ref::<GetObjectError>() {
+                Some(GetObjectError::NoSuchKey(_)) => 404,
+                Some(GetObjectError::InvalidObjectState(_)) => 500,
+                None => unreachable!("Failed to downcast to a GetObjetError"),
+            },
+        }
+    }
+
+    fn body(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>
+    {
+        match &self.error {
+            None => {
+                let response = self.response.take().expect("We should have a response");
+
+                let mut lock = response.lock().expect("Should lock");
+
+                match lock.body.take() {
+                    Some(body) => Box::pin(RadosGWResponseInner::new(body)),
+                    None => Box::pin(futures::stream::empty()),
+                }
+            }
+            Some(_) => Box::pin(futures::stream::empty()),
+        }
+    }
+
+    fn body_chunked(
+        &mut self,
+        chunk_size: usize,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>
+    {
+        match &self.error {
+            None => {
+                let response = self.response.take().expect("We should have a response");
+
+                let mut lock = response.lock().expect("Should lock");
+
+                match lock.body.take() {
+                    Some(body) => Box::pin(ProviderResponseStreamChunk::new(
+                        Box::pin(RadosGWResponseInner::new(body)),
+                        chunk_size,
+                    )),
+                    None => Box::pin(futures::stream::empty()),
+                }
+            }
+            Some(_) => Box::pin(futures::stream::empty()),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for RadosGW {
+    async fn get_buckets(&self) -> anyhow::Result<Vec<String>> {
+        todo!()
+    }
+    async fn list_objects(&self, max_keys: usize) -> anyhow::Result<ProviderObjects> {
+        self.list_objects(Some(max_keys as i64))
+            .await
+            .map(|result| {
+                result
+                    .iter()
+                    .map(|(key, object)| (key.clone(), object.into()))
+                    .collect()
+            })
+    }
+    async fn get_object_metadata(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<ProviderObjectMetadata> {
+        self.get_object_metadata(object)
+            .await
+            .map(|response| response.into())
+    }
+    async fn get_object(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<Box<dyn ProviderResponse>> {
+        let object = self.get_object(object).await;
+
+        let x: Box<dyn ProviderResponse> = Box::new(RadosGWResponse::new(object));
+        Ok(x)
     }
 }

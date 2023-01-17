@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::Debug,
     pin::Pin,
     str::FromStr,
@@ -14,9 +14,12 @@ use dyn_clone::DynClone;
 use futures::{Stream, StreamExt};
 use tracing::{event, instrument, Level};
 
-use crate::riakcs::{
-    dto::{ObjectContents, ObjectMetadataResponse},
-    RiakCS,
+use crate::{
+    radosgw::RadosGW,
+    riakcs::{
+        dto::{ObjectContents, ObjectMetadataResponse},
+        RiakCS,
+    },
 };
 
 pub struct ProviderConf {
@@ -75,6 +78,21 @@ impl From<&ObjectContents> for ProviderObject {
             etag: value.get_etag(),
             last_modified: value.get_last_modified(),
             size: value.get_size(),
+        }
+    }
+}
+
+impl From<&rusoto_s3::Object> for ProviderObject {
+    fn from(value: &rusoto_s3::Object) -> Self {
+        ProviderObject {
+            key: value.key.clone().expect("Object key shouldn't be null"),
+            last_modified: value
+                .last_modified
+                .clone()
+                .map(|e| DateTime::from_str(&e).expect("Object last_modified should be a date"))
+                .expect("Object last_modified shouldn't be null"),
+            etag: value.e_tag.clone().expect("Object ETag shouldn't be null"),
+            size: value.size.expect("Object size shouldn't be null") as u64,
         }
     }
 }
@@ -154,6 +172,31 @@ impl From<ObjectMetadataResponse> for ProviderObjectMetadata {
     }
 }
 
+impl From<rusoto_s3::HeadObjectOutput> for ProviderObjectMetadata {
+    fn from(value: rusoto_s3::HeadObjectOutput) -> Self {
+        ProviderObjectMetadata {
+            acl_public: false,
+            last_modified: value.last_modified.map(|d| {
+                DateTime::parse_from_rfc2822(&d).expect(&format!(
+                    "Object should have a valid last modified date: {}",
+                    d
+                ))
+            }),
+            etag: value.e_tag,
+            content_type: value.content_type,
+            content_length: value
+                .content_length
+                .expect("Object should have a content length") as usize,
+            cache_control: value.cache_control,
+            content_disposition: value.content_disposition,
+            content_encoding: value.content_encoding,
+            content_language: value.content_language,
+            content_md5: None,
+            expires: value.expires,
+        }
+    }
+}
+
 /// This struct exists so we can share a single RiakResponseStreamChunk
 /// that will be fed to multiple ByteStream instances, without losing the
 /// ownership on the inner Stream.
@@ -224,12 +267,134 @@ pub trait Provider: Debug + DynClone + Send + Sync {
 
 dyn_clone::clone_trait_object!(Provider);
 
-pub fn get_provider(provider: &str, conf: ProviderConf) -> impl Provider {
+pub fn get_provider(provider: &str, conf: ProviderConf) -> Box<dyn Provider> {
     match provider {
-        "riak-cs" => RiakCS::new(conf.endpoint, conf.access_key, conf.secret_key, conf.bucket),
+        "riak-cs" => Box::new(RiakCS::new(
+            conf.endpoint,
+            conf.access_key,
+            conf.secret_key,
+            conf.bucket,
+        )),
+        "cellar" | "aws-s3" => Box::new(RadosGW::new(
+            conf.endpoint,
+            conf.access_key,
+            conf.secret_key,
+            conf.bucket,
+        )),
         p => {
             event!(Level::ERROR, "Unknown provider {}", p);
             unreachable!();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ProviderResponseStreamChunkState {
+    Active,
+    Ended,
+    Error(std::io::Error),
+}
+
+/// This structure exists because when we give a part to upload to rusoto
+/// it will read until the end of the stream to end the part instead of just reading what the part's size
+/// This structure simulates that, encapsulates the RiakResponseStream and keep an internal state on when to end the stream
+/// because a part has been fully read.
+pub struct ProviderResponseStreamChunk {
+    response: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    chunk_size: usize,
+    chunks: VecDeque<Bytes>,
+    returned_bytes: usize,
+    state: ProviderResponseStreamChunkState,
+}
+
+impl ProviderResponseStreamChunk {
+    pub fn new(
+        response: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        chunk_size: usize,
+    ) -> ProviderResponseStreamChunk {
+        ProviderResponseStreamChunk {
+            response,
+            chunk_size,
+            chunks: VecDeque::new(),
+            returned_bytes: 0,
+            state: ProviderResponseStreamChunkState::Active,
+        }
+    }
+}
+
+impl Stream for ProviderResponseStreamChunk {
+    type Item = Result<Bytes, std::io::Error>;
+
+    #[allow(clippy::branches_sharing_code)]
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        event!(Level::TRACE, "ProviderResponseStreamChunk: poll_next, chunk_size={}, chunks_len={}, returned_bytes={}, state={:?}", self.chunk_size, self.chunks.len(), self.returned_bytes, self.state);
+        if let ProviderResponseStreamChunkState::Error(err) = &self.state {
+            return Poll::Ready(Some(Err(std::io::Error::new(err.kind(), err.to_string()))));
+        }
+
+        match Pin::new(&mut self.response).poll_next(cx) {
+            Poll::Ready(None) => {
+                event!(
+                    Level::TRACE,
+                    "ProviderResponseStreamChunk poll: got EOF from provider"
+                );
+                self.state = ProviderResponseStreamChunkState::Ended;
+            }
+            Poll::Ready(Some(Ok(bytes))) => {
+                event!(
+                    Level::TRACE,
+                    "ProviderResponseStreamChunk: Got new chunk of length: {}",
+                    bytes.len()
+                );
+                self.chunks.push_back(bytes);
+            }
+            Poll::Ready(Some(Err(error))) => {
+                event!(
+                    Level::TRACE,
+                    "ProviderResponseStreamChunk: Got error from stream, {:?}",
+                    error
+                );
+                self.state = ProviderResponseStreamChunkState::Error(error);
+            }
+            Poll::Pending => {}
+        };
+
+        if self.returned_bytes == self.chunk_size {
+            event!(Level::TRACE, "ProviderResponseStreamChunk: our stream has returned all needed bytes for now. Reset returned_bytes to 0.");
+            self.returned_bytes = 0;
+        }
+
+        if !self.chunks.is_empty() {
+            event!(
+                Level::TRACE,
+                "ProviderResponseStreamChunk: we have some chunks ({}) to return. returned_bytes={}",
+                self.chunks.len(),
+                self.returned_bytes
+            );
+            let mut chunk = self.chunks.pop_front().unwrap();
+            let diff = self.chunk_size - self.returned_bytes;
+            event!(
+                Level::TRACE,
+                "ProviderResponseStreamChunk: current chunk len={}, diff={}",
+                chunk.len(),
+                diff
+            );
+            if diff > chunk.len() {
+                self.returned_bytes += chunk.len();
+                event!(Level::TRACE, "ProviderResponseStreamChunk: chunk is smaller than needed diff, returning it. returned_bytes={}", self.returned_bytes);
+                Poll::Ready(Some(Ok(chunk)))
+            } else {
+                let new_chunk = chunk.split_off(diff);
+                self.chunks.push_front(new_chunk);
+                self.returned_bytes += chunk.len();
+                event!(Level::TRACE, "ProviderResponseStreamChunk: chunk is bigger than needed diff, only returning a portion. returned_bytes={}", self.returned_bytes);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+        } else if let ProviderResponseStreamChunkState::Ended = self.state {
+            self.returned_bytes = 0;
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
         }
     }
 }

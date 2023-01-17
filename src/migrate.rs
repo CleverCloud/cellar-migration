@@ -8,8 +8,8 @@ use std::time::Duration;
 use tracing::{event, instrument, Level};
 
 use crate::{
+    provider::{get_provider, Provider, ProviderConf, ProviderObject},
     radosgw::{uploader::Uploader, RadosGW},
-    riakcs::{dto::ObjectContents, RiakCS},
 };
 
 #[derive(Debug)]
@@ -17,7 +17,7 @@ pub struct BucketMigrationStats {
     pub bucket: String,
     pub synchronization_time: Duration,
     pub synchronization_size: usize,
-    pub objects: Vec<ObjectContents>,
+    pub objects: Vec<ProviderObject>,
     pub objects_to_delete: Vec<rusoto_s3::Object>,
 }
 
@@ -45,6 +45,7 @@ pub struct BucketMigrationConfiguration {
     pub source_access_key: String,
     pub source_secret_key: String,
     pub source_endpoint: String,
+    pub source_provider: String,
     pub destination_bucket: String,
     pub destination_access_key: String,
     pub destination_secret_key: String,
@@ -62,12 +63,14 @@ pub async fn migrate_bucket(
 ) -> anyhow::Result<BucketMigrationStats> {
     let sync_start = std::time::Instant::now();
 
-    let riak_client = RiakCS::new(
+    let source_provider_conf = ProviderConf::new(
         conf.source_endpoint,
         conf.source_access_key,
         conf.source_secret_key,
         Some(conf.source_bucket.clone()),
     );
+
+    let source_provider = get_provider(&conf.source_provider, source_provider_conf);
 
     let radosgw_client = RadosGW::new(
         conf.destination_endpoint,
@@ -76,10 +79,7 @@ pub async fn migrate_bucket(
         Some(conf.destination_bucket),
     );
 
-    event!(Level::DEBUG, "riak client: {:#?}", riak_client);
-    event!(Level::DEBUG, "radosgw_client: {:#?}", radosgw_client);
-
-    let riak_objects_fut = riak_client.list_objects(conf.max_keys);
+    let source_objects_fut = source_provider.list_objects(conf.max_keys);
     let radosgw_objects_fut = radosgw_client.list_objects(None).or_else(|error| {
         async move {
             match error {
@@ -95,24 +95,25 @@ pub async fn migrate_bucket(
         }
     });
 
-    let objects_listing_result = futures::future::join(riak_objects_fut, radosgw_objects_fut).await;
-    let riak_objects = objects_listing_result.0?;
+    let objects_listing_result =
+        futures::future::join(source_objects_fut, radosgw_objects_fut).await;
+    let source_objects = objects_listing_result.0?;
     let radosgw_objects = objects_listing_result.1?;
 
-    event!(Level::DEBUG, "Riakcs objects: {}", riak_objects.len());
+    event!(Level::DEBUG, "Riakcs objects: {}", source_objects.len());
     event!(Level::DEBUG, "Radosgw objects: {}", radosgw_objects.len());
 
-    let objects_to_migrate: Vec<ObjectContents> = riak_objects
+    let objects_to_migrate: Vec<ProviderObject> = source_objects
         .iter()
         .filter_map(|(key, object)| {
             if let Some(found) = radosgw_objects.get(key) {
                 if object != found {
-                    Some(object.clone())
+                    Some(object.clone().into())
                 } else {
                     None
                 }
             } else {
-                Some(object.clone())
+                Some(object.clone().into())
             }
         })
         .collect();
@@ -121,7 +122,7 @@ pub async fn migrate_bucket(
         radosgw_objects
             .iter()
             .filter_map(|(key, object)| {
-                if riak_objects.get(key).is_none() {
+                if source_objects.get(key).is_none() {
                     Some(object.clone())
                 } else {
                     None
@@ -137,7 +138,7 @@ pub async fn migrate_bucket(
     if !conf.dry_run {
         if objects_to_sync > 0 {
             let mut uploader = Uploader::new(
-                riak_client,
+                Box::new(source_provider),
                 radosgw_client,
                 objects_to_migrate.clone(),
                 objects_to_delete.clone(),
@@ -194,7 +195,7 @@ pub async fn migrate_bucket(
                                 .iter()
                                 .filter(|result| result.is_ok())
                                 .map(|result| result.as_ref().unwrap())
-                                .collect::<Vec<&ObjectContents>>()
+                                .collect::<Vec<&ProviderObject>>()
                         })
                         .fold(0, |acc, object| acc + object.get_size() as usize),
                     objects: objects_to_migrate,

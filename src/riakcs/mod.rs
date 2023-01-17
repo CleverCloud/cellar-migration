@@ -3,17 +3,24 @@ pub mod dto;
 use std::collections::HashMap;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use chrono::{DateTime, Duration, Utc};
 use dto::{ListObjectResponse, ObjectContents};
-use hyper::{body::HttpBody, Body, Client, Method, Response};
+use hyper::{body::HttpBody, Body, Client, Method, Response, StatusCode};
 use hyper_tls::HttpsConnector;
 use ring::hmac;
 use serde::Deserialize;
 use serde_xml_rs::{de::Deserializer, ParserConfig};
 use tracing::{event, instrument, Level};
 
-use crate::riakcs::dto::ListBucketsResult;
+use crate::{
+    provider::{
+        Provider, ProviderObject, ProviderObjectMetadata, ProviderObjects, ProviderResponse,
+    },
+    radosgw::uploader::{RiakResponseStream, RiakResponseStreamChunk},
+    riakcs::dto::ListBucketsResult,
+};
 
 use self::dto::{ListBucket, ObjectMetadata, ObjectMetadataResponse};
 
@@ -136,7 +143,7 @@ impl RiakCS {
         );
     }
 
-    fn sign_url(&self, object: &ObjectContents, expiry: DateTime<Utc>) -> String {
+    fn sign_url(&self, object: &ProviderObject, expiry: DateTime<Utc>) -> String {
         let to_sign = format!(
             "GET\n\n\n{}\n/{}/{}",
             expiry.timestamp(),
@@ -245,7 +252,7 @@ impl RiakCS {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn get_download_url(&self, object: &ObjectContents) -> String {
+    fn get_download_url(&self, object: &ProviderObject) -> String {
         let uri = self.get_uri();
         let expires = Utc::now() + Duration::hours(1);
         let signature = self.sign_url(object, expires);
@@ -268,7 +275,7 @@ impl RiakCS {
     }
 
     #[instrument(skip(self), level = "debug")]
-    pub async fn get_object(&self, object: &ObjectContents) -> Result<Response<Body>> {
+    pub async fn get_object(&self, object: &ProviderObject) -> Result<Response<Body>> {
         let url = self.get_download_url(object);
 
         let req = hyper::Request::builder()
@@ -304,7 +311,7 @@ impl RiakCS {
     #[instrument(skip(self), level = "debug")]
     async fn _get_object_metadata(
         &self,
-        object: &ObjectContents,
+        object: &ProviderObject,
         with_signature: bool,
     ) -> Result<ObjectMetadataResponse> {
         let uri = format!(
@@ -350,7 +357,7 @@ impl RiakCS {
     #[instrument(skip(self), level = "debug")]
     pub async fn get_object_metadata(
         &self,
-        object: &ObjectContents,
+        object: &ProviderObject,
     ) -> Result<ObjectMetadataResponse> {
         self._get_object_metadata(object, false).await
     }
@@ -366,5 +373,89 @@ impl RiakCS {
         let response: ListBucketsResult = self.send_request_deser(req).await?;
 
         Ok(response.get_buckets().to_vec())
+    }
+}
+
+#[async_trait]
+impl Provider for RiakCS {
+    async fn get_buckets(&self) -> anyhow::Result<Vec<String>> {
+        let riak_buckets = self.list_buckets().await?;
+        let buckets = riak_buckets
+            .iter()
+            .map(|bucket| bucket.name.clone())
+            .collect();
+        Ok(buckets)
+    }
+
+    async fn list_objects(&self, max_keys: usize) -> Result<ProviderObjects> {
+        self.list_objects(max_keys).await.map(|objects| {
+            objects
+                .iter()
+                .map(|(key, value)| (key.to_owned(), value.into()))
+                .collect()
+        })
+    }
+
+    async fn get_object_metadata(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<ProviderObjectMetadata> {
+        self.get_object_metadata(object)
+            .await
+            .map(|metadata| metadata.into())
+    }
+
+    async fn get_object(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<Box<dyn ProviderResponse>> {
+        self.get_object(object).await.map(|res| {
+            let x: Box<dyn ProviderResponse> = Box::new(RiakCSResponse::new(res));
+            x
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RiakCSResponse {
+    response: Option<Response<Body>>,
+    status: StatusCode,
+}
+
+impl RiakCSResponse {
+    pub fn new(response: Response<Body>) -> RiakCSResponse {
+        let status = response.status();
+        RiakCSResponse {
+            response: Some(response),
+            status,
+        }
+    }
+}
+
+impl ProviderResponse for RiakCSResponse {
+    fn status(&self) -> u16 {
+        self.status.as_u16()
+    }
+
+    fn body(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>> + Send>,
+    > {
+        Box::pin(RiakResponseStream::new(
+            self.response.take().expect("We should have a response"),
+        ))
+    }
+
+    fn body_chunked(
+        &mut self,
+        chunk_size: usize,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>> + Send>,
+    > {
+        Box::pin(RiakResponseStreamChunk::new(
+            RiakResponseStream::new(self.response.take().expect("We should have a response")),
+            chunk_size,
+        ))
     }
 }

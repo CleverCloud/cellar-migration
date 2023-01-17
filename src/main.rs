@@ -1,4 +1,5 @@
 mod migrate;
+mod provider;
 mod radosgw;
 mod riakcs;
 
@@ -12,8 +13,10 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
 use crate::migrate::{BucketMigrationError, BucketMigrationStats};
-use crate::riakcs::dto::ObjectContents;
-use crate::riakcs::RiakCS;
+use crate::provider::get_provider;
+use crate::provider::Provider;
+use crate::provider::ProviderConf;
+use crate::provider::ProviderObject;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,6 +38,8 @@ async fn main() -> anyhow::Result<()> {
             .arg(Arg::new("source-bucket").long("source-bucket").help("Source bucket from which files will be copied. If omitted, all buckets of the add-on will be synchronized"))
             .arg(Arg::new("source-access-key").long("source-access-key").help("Source bucket Cellar access key").required(true))
             .arg(Arg::new("source-secret-key").long("source-secret-key").help("Source bucket Cellar secret key").required(true))
+            .arg(Arg::new("source-endpoint").long("source-endpoint").help("Source endpoint of the S3 Bucket").required(true))
+            .arg(Arg::new("source-provider").long("source-provider").help("Provider for source bucket (AWS, Ceph, RiakCS, ..)").required(true))
             .arg(Arg::new("destination-bucket").long("destination-bucket").help("Destination bucket to which the files will be copied. If omitted, the bucket will be created if it doesn't exist"))
             .arg(Arg::new("destination-bucket-prefix").long("destination-bucket-prefix").help("Prefix to apply to the destination bucket name"))
             .arg(Arg::new("destination-access-key").long("destination-access-key").help("Destination bucket Cellar access key").required(true))
@@ -108,7 +113,15 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         .get_one::<String>("source-secret-key")
         .unwrap()
         .to_string();
-    let source_endpoint = "cellar.services.clever-cloud.com".to_string();
+    let source_endpoint = params
+        .get_one::<String>("source-endpoint")
+        .unwrap()
+        .to_string();
+
+    let source_provider_str = params
+        .get_one::<String>("source-provider")
+        .map(|s| s.as_str())
+        .unwrap();
 
     let destination_bucket = params
         .get_one::<String>("destination-bucket")
@@ -137,6 +150,15 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
 
     let sync_start = std::time::Instant::now();
 
+    let source_provider_conf = ProviderConf::new(
+        source_endpoint.clone(),
+        source_access_key.clone(),
+        source_secret_key.clone(),
+        None,
+    );
+
+    let source_provider = get_provider(&source_provider_str, source_provider_conf);
+
     let buckets_to_migrate = if let Some(bucket) = source_bucket.as_ref() {
         event!(Level::INFO, "Only bucket {} will be migrated", bucket);
         vec![bucket.clone()]
@@ -145,18 +167,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             Level::INFO,
             "All buckets of this Cellar add-ons will be migrated"
         );
-        let riak_client = RiakCS::new(
-            source_endpoint.clone(),
-            source_access_key.clone(),
-            source_secret_key.clone(),
-            None,
-        );
 
-        let riak_buckets = riak_client.list_buckets().await?;
-        riak_buckets
-            .iter()
-            .map(|bucket| bucket.name.clone())
-            .collect()
+        source_provider.get_buckets().await?
     };
 
     // First make sure the destination buckets exist / can be created
@@ -221,6 +233,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             source_access_key: source_access_key.clone(),
             source_secret_key: source_secret_key.clone(),
             source_endpoint: source_endpoint.clone(),
+            source_provider: source_provider_str.to_string(),
             destination_bucket: format!("{}{}", destination_bucket_prefix, destination_bucket),
             destination_access_key: destination_access_key.clone(),
             destination_secret_key: destination_secret_key.clone(),
@@ -275,7 +288,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             .iter()
             .map(|stat| &stat.objects)
             .flatten()
-            .collect::<Vec<&ObjectContents>>();
+            .collect::<Vec<&ProviderObject>>();
 
         let all_objects_to_delete = all_stats
             .iter()

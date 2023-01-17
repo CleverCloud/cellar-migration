@@ -15,7 +15,7 @@ use rusoto_s3::{
 };
 use tracing::{event, instrument, Level};
 
-use crate::riakcs::dto::ObjectMetadataResponse;
+use crate::provider::ProviderObjectMetadata;
 
 #[derive(Debug, Clone)]
 pub struct RadosGW {
@@ -62,7 +62,7 @@ impl RadosGW {
     pub async fn put_object(
         &self,
         key: String,
-        object_metadata: &ObjectMetadataResponse,
+        object_metadata: &ProviderObjectMetadata,
         size: i64,
         body: ByteStream,
     ) -> Result<PutObjectOutput, RusotoError<PutObjectError>> {
@@ -79,13 +79,13 @@ impl RadosGW {
             } else {
                 None
             },
-            cache_control: object_metadata.metadata.cache_control.clone(),
-            content_disposition: object_metadata.metadata.content_disposition.clone(),
-            content_encoding: object_metadata.metadata.content_encoding.clone(),
-            content_language: object_metadata.metadata.content_language.clone(),
-            content_md5: object_metadata.metadata.content_md5.clone(),
-            content_type: object_metadata.metadata.content_type.clone(),
-            expires: object_metadata.metadata.expires.clone(),
+            cache_control: object_metadata.cache_control.clone(),
+            content_disposition: object_metadata.content_disposition.clone(),
+            content_encoding: object_metadata.content_encoding.clone(),
+            content_language: object_metadata.content_language.clone(),
+            content_md5: object_metadata.content_md5.clone(),
+            content_type: object_metadata.content_type.clone(),
+            expires: object_metadata.expires.clone(),
             ..Default::default()
         };
 
@@ -97,7 +97,7 @@ impl RadosGW {
     pub async fn create_multipart_upload(
         &self,
         key: String,
-        object_metadata: &ObjectMetadataResponse,
+        object_metadata: &ProviderObjectMetadata,
     ) -> Result<CreateMultipartUploadOutput, RusotoError<CreateMultipartUploadError>> {
         let multipart_upload_request = CreateMultipartUploadRequest {
             key,
@@ -111,12 +111,12 @@ impl RadosGW {
                 None
             },
             // We don't have the content_md5 in this list but I don't think we really care
-            cache_control: object_metadata.metadata.cache_control.clone(),
-            content_disposition: object_metadata.metadata.content_disposition.clone(),
-            content_encoding: object_metadata.metadata.content_encoding.clone(),
-            content_language: object_metadata.metadata.content_language.clone(),
-            content_type: object_metadata.metadata.content_type.clone(),
-            expires: object_metadata.metadata.expires.clone(),
+            cache_control: object_metadata.cache_control.clone(),
+            content_disposition: object_metadata.content_disposition.clone(),
+            content_encoding: object_metadata.content_encoding.clone(),
+            content_language: object_metadata.content_language.clone(),
+            content_type: object_metadata.content_type.clone(),
+            expires: object_metadata.expires.clone(),
             ..Default::default()
         };
 

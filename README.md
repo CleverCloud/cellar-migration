@@ -57,7 +57,7 @@ Then, to synchronize all your buckets, you will have to start a synchronization 
 Replace the first `bucket1 bucket2 bucket3` with the buckets you want to synchronize and in the `if / elif` below, set the `destination_bucket` to the appropriate value
 to override your unavailable bucket name.
 
-Write this in a `synchronize.sh` file in your current directory.
+Write this in a `synchronize.sh` file in your current directory (example below to migrate from S3 AWS to Cellar).
 
 ```bash
 #!/usr/bin/env bash
@@ -75,10 +75,13 @@ main() {
     fi
 
     cellar-migration migrate \
+      --execute \
       --source-bucket "${bucket}" \
-      --source-endpoint "cellar-c2.services.clever-cloud.com"
-      --source-provider "cellar"
+      --source-endpoint "s3.amazonaws.com" \
+      --source-region "<eg: eu-west-1, etc>" \
+      --source-provider "aws-s3" \
       --destination-bucket "${destination_bucket}" \
+      --destination-endpoint "cellar-c2.services.clever-cloud.com" \
       --source-access-key "<source_key>" \
       --source-secret-key "<source_secret>" \
       --destination-access-key "<destination_key>" \

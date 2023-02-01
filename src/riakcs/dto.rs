@@ -110,7 +110,7 @@ impl From<Response<Body>> for ObjectMetadata {
                 )
                 .expect("Last Modified header should be a valid UTC date")
             }),
-            etag: Self::extract_header(&response, "etag").map(|etag| etag.replace("\"", "")),
+            etag: Self::extract_header(&response, "etag").map(|etag| etag.replace('\"', "")),
             content_type: Self::extract_header(&response, "content-type"),
             content_length: Self::extract_header(&response, "content-length")
                 .map(|ct| {
@@ -148,6 +148,6 @@ pub struct ListBucketsResult {
 
 impl ListBucketsResult {
     pub fn get_buckets(&self) -> Vec<ListBucket> {
-        self.buckets.bucket.clone().unwrap_or_else(Vec::new)
+        self.buckets.bucket.clone().unwrap_or_default()
     }
 }

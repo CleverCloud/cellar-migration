@@ -161,7 +161,7 @@ impl From<ObjectMetadataResponse> for ProviderObjectMetadata {
         let m = value.metadata;
         ProviderObjectMetadata {
             acl_public: value.acl_public,
-            last_modified: m.last_modified.clone(),
+            last_modified: m.last_modified,
             etag: m.etag.clone(),
             content_type: m.content_type.clone(),
             content_length: m.content_length,
@@ -170,7 +170,7 @@ impl From<ObjectMetadataResponse> for ProviderObjectMetadata {
             content_encoding: m.content_encoding.clone(),
             content_language: m.content_language.clone(),
             content_md5: m.content_md5.clone(),
-            expires: m.expires.clone(),
+            expires: m.expires,
         }
     }
 }
@@ -180,10 +180,9 @@ impl From<rusoto_s3::HeadObjectOutput> for ProviderObjectMetadata {
         ProviderObjectMetadata {
             acl_public: false,
             last_modified: value.last_modified.map(|d| {
-                DateTime::parse_from_rfc2822(&d).expect(&format!(
-                    "Object should have a valid last modified date: {}",
-                    d
-                ))
+                DateTime::parse_from_rfc2822(&d).unwrap_or_else(|_| {
+                    panic!("Object should have a valid last modified date: {}", d)
+                })
             }),
             etag: value.e_tag,
             content_type: value.content_type,
@@ -200,17 +199,18 @@ impl From<rusoto_s3::HeadObjectOutput> for ProviderObjectMetadata {
     }
 }
 
+type ProviderResponseStreamInner =
+    Arc<Mutex<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>>>;
+
 /// This struct exists so we can share a single RiakResponseStreamChunk
 /// that will be fed to multiple ByteStream instances, without losing the
 /// ownership on the inner Stream.
 pub struct ProviderResponseStreamChunkWrapper {
-    inner: Arc<Mutex<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>>>,
+    inner: ProviderResponseStreamInner,
 }
 
 impl ProviderResponseStreamChunkWrapper {
-    pub fn new(
-        inner: Arc<Mutex<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>>>,
-    ) -> ProviderResponseStreamChunkWrapper {
+    pub fn new(inner: ProviderResponseStreamInner) -> ProviderResponseStreamChunkWrapper {
         ProviderResponseStreamChunkWrapper { inner }
     }
 }

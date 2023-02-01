@@ -193,7 +193,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         None,
     );
 
-    let source_provider = get_provider(&source_provider_str, source_provider_conf);
+    let source_provider = get_provider(source_provider_str, source_provider_conf);
 
     let buckets_to_migrate = if let Some(bucket) = source_bucket.as_ref() {
         event!(Level::INFO, "Only bucket {} will be migrated", bucket);
@@ -312,25 +312,22 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
     if dry_run {
         let all_stats = migration_results
             .iter()
-            .map(|result| match result {
+            .filter_map(|result| match result {
                 Ok(stats) => Some(stats),
                 Err(error) => error
                     .downcast_ref::<BucketMigrationError>()
                     .map(|err| &err.stats),
             })
-            .flatten()
             .collect::<Vec<&BucketMigrationStats>>();
 
         let all_objects = all_stats
             .iter()
-            .map(|stat| &stat.objects)
-            .flatten()
+            .flat_map(|stat| &stat.objects)
             .collect::<Vec<&ProviderObject>>();
 
         let all_objects_to_delete = all_stats
             .iter()
-            .map(|stat| &stat.objects_to_delete)
-            .flatten()
+            .flat_map(|stat| &stat.objects_to_delete)
             .collect::<Vec<&rusoto_s3::Object>>();
 
         event!(
@@ -338,7 +335,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             "Those objects need to be sync: {:#?}",
             all_stats
                 .iter()
-                .map(|stats| {
+                .flat_map(|stats| {
                     stats.objects.iter().map(|object| {
                         format!(
                             "{}/{} - {}",
@@ -348,7 +345,6 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
                         )
                     })
                 })
-                .flatten()
                 .collect::<Vec<String>>()
         );
 
@@ -360,7 +356,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
                 "Those objects will be deleted on the destination bucket because they are not on the source bucket: {:#?}",
                 all_stats
                     .iter()
-                    .map(|stats| {
+                    .flat_map(|stats| {
                         stats.objects_to_delete.iter().map(|object| {
                             format!(
                                 "{}/{} - {}",
@@ -370,7 +366,6 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
                             )
                         })
                     })
-                    .flatten()
                     .collect::<Vec<String>>()
             );
             event!(
@@ -382,7 +377,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
 
         let total_sync_bytes = all_objects
             .iter()
-            .fold(0, |acc, object| acc + object.get_size() as u64);
+            .fold(0, |acc, object| acc + object.get_size());
 
         event!(
             Level::INFO,

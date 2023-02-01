@@ -116,12 +116,12 @@ pub async fn migrate_bucket(
         .filter_map(|(key, object)| {
             if let Some(found) = radosgw_objects.get(key) {
                 if object != found {
-                    Some(object.clone().into())
+                    Some(object.clone())
                 } else {
                     None
                 }
             } else {
-                Some(object.clone().into())
+                Some(object.clone())
             }
         })
         .collect();
@@ -201,8 +201,7 @@ pub async fn migrate_bucket(
                                 .unwrap()
                                 .sync_results
                                 .iter()
-                                .filter(|result| result.is_ok())
-                                .map(|result| result.as_ref().unwrap())
+                                .filter_map(|result| result.as_ref().ok())
                                 .collect::<Vec<&ProviderObject>>()
                         })
                         .fold(0, |acc, object| acc + object.get_size() as usize),

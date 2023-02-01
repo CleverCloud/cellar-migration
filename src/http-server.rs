@@ -10,7 +10,7 @@ async fn hello_world(_req: Request<Body>) -> Result<Response<Body>, Infallible> 
 
 #[tokio::main]
 async fn main() {
-    let port = std::env::var("PORT").unwrap_or("8080".to_string());
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = SocketAddr::from((
         [0, 0, 0, 0],
         port.parse::<u16>().expect("Port variable should be a u16"),

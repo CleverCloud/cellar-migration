@@ -339,7 +339,7 @@ impl RadosGW {
         client
             .list_buckets()
             .await
-            .map_err(|err| anyhow::Error::from(err))
+            .map_err(anyhow::Error::from)
             .map(|result| result.buckets.unwrap_or_default())
     }
 
@@ -380,7 +380,7 @@ impl RadosGW {
         client
             .head_object(head_object_request)
             .await
-            .map_err(|err| anyhow::Error::from(err))
+            .map_err(anyhow::Error::from)
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -399,7 +399,7 @@ impl RadosGW {
         client
             .get_object(get_object_request)
             .await
-            .map_err(|err| anyhow::Error::from(err))
+            .map_err(anyhow::Error::from)
     }
 }
 
@@ -438,7 +438,7 @@ impl RadosGWResponse {
         };
         RadosGWResponse {
             response: res,
-            error: error,
+            error,
         }
     }
 }

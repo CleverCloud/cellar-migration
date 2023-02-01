@@ -96,7 +96,7 @@ impl Uploader {
                         );
 
                         let result = Uploader::sync_object(
-                            &riak_client,
+                            &*riak_client,
                             &radosgw_client,
                             &object,
                             thread_id,
@@ -156,7 +156,7 @@ impl Uploader {
     }
 
     pub async fn sync_object(
-        source_provider_client: &Box<dyn Provider>,
+        source_provider_client: &dyn Provider,
         radosgw_client: &RadosGW,
         object: &ProviderObject,
         thread_id: usize,

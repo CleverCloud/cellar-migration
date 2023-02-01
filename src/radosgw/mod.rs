@@ -28,6 +28,8 @@ use crate::provider::{
     ProviderResponseStreamChunk,
 };
 
+const REQUESTS_MAX_RETRIES: usize = 5;
+
 #[derive(Debug, Clone)]
 pub struct RadosGW {
     endpoint: Option<String>,
@@ -242,14 +244,21 @@ impl RadosGW {
         let mut results = HashMap::new();
         let mut start_after = None;
         let mut total_keys: i64 = 0;
+        // Keep track of retries
+        let mut retries = 0;
 
         loop {
+            if retries > REQUESTS_MAX_RETRIES {
+                event!(Level::ERROR, "We've hit max retries when listing objects. Check warning logs for more details");
+                return Err(anyhow::anyhow!("MaxRetriesHit when listing objects"));
+            }
+
             let list_objects_request = ListObjectsV2Request {
                 bucket: self
                     .bucket
                     .clone()
                     .expect("list_objects should have a bucket"),
-                start_after,
+                start_after: start_after.clone(),
                 max_keys: max_results.map(|max| std::cmp::min(max, 1000) as i64),
                 ..Default::default()
             };
@@ -258,7 +267,23 @@ impl RadosGW {
             let objects = client
                 .list_objects_v2(list_objects_request.clone())
                 .await
-                .map(|res| res.contents.unwrap_or_default())?;
+                .map(|res| res.contents.unwrap_or_default());
+
+            // If we get an HTTP error (timeout, connexion reset, ...), just retry
+            if let Err(error) = objects {
+                match error {
+                    RusotoError::HttpDispatch(_) => {
+                        event!(Level::WARN, "Got error when listing objects: {:?}", error);
+                        retries += 1;
+                        continue;
+                    }
+                    _ => return Err(anyhow::Error::from(error)),
+                }
+            } else {
+                retries = 0;
+            }
+
+            let objects = objects.unwrap();
 
             if objects.is_empty() {
                 break;

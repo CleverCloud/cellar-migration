@@ -207,13 +207,6 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         source_provider.get_buckets().await?
     };
 
-    event!(
-        Level::INFO,
-        "Destination endpoint: {:?}, access key: {:?}, secret key: {:?}",
-        destination_endpoint,
-        destination_access_key,
-        destination_secret_key
-    );
     // First make sure the destination buckets exist / can be created
     // If not, exit now
     if let Err(error) = migrate::create_destination_buckets(

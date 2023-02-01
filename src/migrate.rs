@@ -2,7 +2,7 @@ use std::{collections::HashMap, error};
 
 use futures::TryFutureExt;
 
-use rusoto_core::{Region, RusotoError};
+use rusoto_core::RusotoError;
 use rusoto_s3::{CreateBucketError, ListObjectsV2Error};
 use std::time::Duration;
 use tracing::{event, instrument, Level};

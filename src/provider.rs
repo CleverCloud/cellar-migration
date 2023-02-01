@@ -12,7 +12,6 @@ use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, FixedOffset, Utc};
 use dyn_clone::DynClone;
 use futures::{Stream, StreamExt};
-use rusoto_core::Region;
 use tracing::{event, instrument, Level};
 
 use crate::{

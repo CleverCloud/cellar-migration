@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use rusoto_core::{ByteStream, Region, RusotoError};
+use rusoto_core::{ByteStream, RusotoError};
 use rusoto_s3::{
     AbortMultipartUploadError, AbortMultipartUploadOutput, AbortMultipartUploadRequest, Bucket,
     CompleteMultipartUploadError, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,

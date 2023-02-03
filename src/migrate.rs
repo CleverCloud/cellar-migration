@@ -290,7 +290,7 @@ pub async fn migrate_bucket(
                         });
 
                         event!(Level::INFO,
-                            "Current status: {} objects to sync for a size of {}",
+                            "Current sync status: {} objects to sync for a total size of {}",
                             total_files_sync,
                             ByteSize(total_synced_size as u64)
                         );
@@ -306,6 +306,12 @@ pub async fn migrate_bucket(
                                     ByteSize(object.get_size())
                                 )
                             });
+
+                            event!(Level::INFO,
+                                "Current delete status: {} objects to delete for a total size of {}",
+                                total_files_delete,
+                                ByteSize(total_deleted_size as u64)
+                            );
                         }
                     }
                     BucketObjectsMigrationResult::Executed(mut results) => {
@@ -327,14 +333,28 @@ pub async fn migrate_bucket(
                                 };
                             }
 
-                            while let Some(res) = result.delete_results.pop() {
-                                match res {
-                                    Ok(size) => total_deleted_size += size,
-                                    Err(err) => {
-                                        event!(Level::WARN, "Failed to delete a file: {:?}", err);
-                                        delete_errors.push(anyhow::anyhow!(err));
-                                    }
-                                };
+                            event!(Level::INFO,
+                                "Current sync status: {} synced objects for a total size of {}",
+                                total_files_sync,
+                                ByteSize(total_synced_size as u64)
+                            );
+
+                            if conf.delete_destination_files {
+                                while let Some(res) = result.delete_results.pop() {
+                                    match res {
+                                        Ok(size) => total_deleted_size += size,
+                                        Err(err) => {
+                                            event!(Level::WARN, "Failed to delete a file: {:?}", err);
+                                            delete_errors.push(anyhow::anyhow!(err));
+                                        }
+                                    };
+                                }
+
+                                event!(Level::INFO,
+                                    "Current delete status: {} deleted objects for a total size of {}",
+                                    total_files_delete,
+                                    ByteSize(total_deleted_size as u64)
+                                );
                             }
                         }
                     }

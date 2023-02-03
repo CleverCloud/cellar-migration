@@ -365,7 +365,13 @@ impl RadosGW {
         client
             .head_object(head_object_request)
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(|error| {
+                anyhow!(
+                    "Error fetching object metadata {}: {:?}",
+                    object.get_key(),
+                    error
+                )
+            })
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -384,7 +390,7 @@ impl RadosGW {
         client
             .get_object(get_object_request)
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(|error| anyhow!("Error fetching object {}: {:?}", object.get_key(), error))
     }
 }
 

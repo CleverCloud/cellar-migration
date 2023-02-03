@@ -320,14 +320,20 @@ pub async fn migrate_bucket(
                             while let Some(res) = result.sync_results.pop() {
                                 match res {
                                     Ok(size) => total_synced_size += size,
-                                    Err(err) => sync_errors.push(anyhow::anyhow!(err)),
+                                    Err(err) => {
+                                        event!(Level::WARN, "Failed to sync a file: {:?}", err);
+                                        sync_errors.push(anyhow::anyhow!(err));
+                                    }
                                 };
                             }
 
                             while let Some(res) = result.delete_results.pop() {
                                 match res {
                                     Ok(size) => total_deleted_size += size,
-                                    Err(err) => delete_errors.push(anyhow::anyhow!(err)),
+                                    Err(err) => {
+                                        event!(Level::WARN, "Failed to delete a file: {:?}", err);
+                                        delete_errors.push(anyhow::anyhow!(err));
+                                    }
                                 };
                             }
                         }

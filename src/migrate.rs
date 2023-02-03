@@ -276,17 +276,24 @@ pub async fn migrate_bucket(
                 match migration_result {
                     BucketObjectsMigrationResult::DryRun(to_migrate, to_delete) => {
                         total_files_sync += to_migrate.len();
+
                         to_migrate.iter().for_each(|object| {
+                            total_synced_size += object.get_size() as usize;
                             event!(
                                 Level::INFO,
-                                "To sync: {}/{} - {}",
+                                "Object to sync : {}/{} - {}",
                                 async_conf.source_bucket,
                                 object.get_key(),
                                 ByteSize(object.get_size())
                             );
 
-                            total_synced_size += object.get_size() as usize;
                         });
+
+                        event!(Level::INFO,
+                            "Current status: {} objects to sync for a size of {}",
+                            total_files_sync,
+                            ByteSize(total_synced_size as u64)
+                        );
 
                         if async_conf.delete_destination_files {
                             total_files_delete += to_delete.len();

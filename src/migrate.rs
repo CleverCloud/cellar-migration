@@ -252,12 +252,25 @@ pub async fn migrate_bucket(
                                 dst_objects.extend(objects)
                             },
                             Some(Err(error)) => {
-                                event!(
-                                    Level::ERROR,
-                                    "Failed to fetch dest objects: {:?}",
-                                    error
-                                );
-                                anyhow::bail!(error);
+                                match error.downcast_ref::<RusotoError<ListObjectsV2Error>>() {
+                                    Some(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(bucket))) => {
+                                        if conf.dry_run {
+                                            // This may be normal since the bucket may not exist yet
+                                            // treat it as empty
+                                            no_more_dst_objects = true;
+                                        } else {
+                                            unreachable!("We started migrating objects but dest bucket {} does not exist", bucket);
+                                        }
+                                    },
+                                    _ => {
+                                        event!(
+                                            Level::ERROR,
+                                            "Failed to fetch dest objects: {:?}",
+                                            error
+                                        );
+                                        anyhow::bail!(error);
+                                    }
+                                }
                             }
                             None => {
                                 no_more_dst_objects = true;

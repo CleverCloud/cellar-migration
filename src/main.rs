@@ -17,9 +17,8 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
 use crate::migrate::{BucketMigrationError, BucketMigrationStats};
-use crate::provider::get_provider;
 use crate::provider::ProviderConf;
-use crate::provider::ProviderObject;
+use crate::provider::{get_provider, Providers};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -70,11 +69,11 @@ async fn main() -> anyhow::Result<()> {
                 .help("Define the maximum number of object keys to list when listing the bucket. Lowering this might help listing huge buckets")
                 .required(false).value_parser(value_parser!(usize)).default_value("1000")
             )
-            .arg(
+            /* .arg(
                 Arg::new("delete").long("delete").short('d')
                 .help("Delete extraneous files from destination bucket")
                 .action(ArgAction::SetTrue)
-            )
+            )*/
         )
         .get_matches();
 
@@ -104,7 +103,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         .get_one("max-keys")
         .expect("max-keys should be a usize");
 
-    let delete_destination_files = params.get_one::<bool>("delete") == Some(&true);
+    //let delete_destination_files = params.get_one::<bool>("delete") == Some(&true);
+    let delete_destination_files = false;
 
     let source_bucket: Option<String> = params
         .get_one("source-bucket")
@@ -124,9 +124,10 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         .get_one::<String>("source-region")
         .map(|s| s.to_owned());
 
-    let source_provider_str = params
+    let source_provider = params
         .get_one::<String>("source-provider")
-        .map(|s| s.as_str())
+        .ok_or("Missing source provider".to_string())
+        .and_then(|s| Providers::try_from(s.as_str()))
         .unwrap();
 
     let destination_bucket = params
@@ -172,7 +173,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             }
         }
         (Some(_), None) => {
-            if source_provider_str == "aws-s3" {
+            if let Providers::AwsS3 = source_provider {
                 event!(
                     Level::ERROR,
                     "For source-provider aws-s3, you need to specify --source-region as well"
@@ -193,8 +194,6 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         None,
     );
 
-    let source_provider = get_provider(source_provider_str, source_provider_conf);
-
     let buckets_to_migrate = if let Some(bucket) = source_bucket.as_ref() {
         event!(Level::INFO, "Only bucket {} will be migrated", bucket);
         vec![bucket.clone()]
@@ -204,7 +203,9 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             "All buckets of this Cellar add-ons will be migrated"
         );
 
-        source_provider.get_buckets().await?
+        get_provider(&source_provider, source_provider_conf)
+            .get_buckets()
+            .await?
     };
 
     // First make sure the destination buckets exist / can be created
@@ -270,7 +271,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             source_secret_key: source_secret_key.clone(),
             source_endpoint: source_endpoint.clone(),
             source_region: source_region.clone(),
-            source_provider: source_provider_str.to_string(),
+            source_provider: source_provider.clone(),
             destination_bucket: format!("{}{}", destination_bucket_prefix, destination_bucket),
             destination_access_key: destination_access_key.clone(),
             destination_secret_key: destination_secret_key.clone(),
@@ -320,82 +321,35 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             })
             .collect::<Vec<&BucketMigrationStats>>();
 
-        let all_objects = all_stats
+        let total_sync_bytes = all_stats
             .iter()
-            .flat_map(|stat| &stat.objects)
-            .collect::<Vec<&ProviderObject>>();
+            .fold(0, |acc, stats| acc + stats.synchronization_size);
 
-        let all_objects_to_delete = all_stats
+        let total_objects_sync: usize = all_stats
             .iter()
-            .flat_map(|stat| &stat.objects_to_delete)
-            .collect::<Vec<&rusoto_s3::Object>>();
-
-        event!(
-            Level::INFO,
-            "Those objects need to be sync: {:#?}",
-            all_stats
-                .iter()
-                .flat_map(|stats| {
-                    stats.objects.iter().map(|object| {
-                        format!(
-                            "{}/{} - {}",
-                            stats.bucket,
-                            object.get_key(),
-                            ByteSize(object.get_size())
-                        )
-                    })
-                })
-                .collect::<Vec<String>>()
-        );
-
-        event!(Level::TRACE, "Objects to sync: {:#?}", all_objects);
-
-        if delete_destination_files {
-            event!(
-                Level::INFO,
-                "Those objects will be deleted on the destination bucket because they are not on the source bucket: {:#?}",
-                all_stats
-                    .iter()
-                    .flat_map(|stats| {
-                        stats.objects_to_delete.iter().map(|object| {
-                            format!(
-                                "{}/{} - {}",
-                                stats.bucket,
-                                object.key.as_ref().unwrap(),
-                                ByteSize(object.size.unwrap_or(0) as u64)
-                            )
-                        })
-                    })
-                    .collect::<Vec<String>>()
-            );
-            event!(
-                Level::TRACE,
-                "Objects to delete: {:#?}",
-                all_objects_to_delete
-            );
-        }
-
-        let total_sync_bytes = all_objects
-            .iter()
-            .fold(0, |acc, object| acc + object.get_size());
+            .fold(0, |acc, stats| acc + stats.total_files_sync);
 
         event!(
             Level::INFO,
             "Total files to sync: {} for a total of {}",
-            all_objects.len(),
-            ByteSize(total_sync_bytes)
+            total_objects_sync,
+            ByteSize(total_sync_bytes as u64)
         );
 
         if delete_destination_files {
-            let total_delete_bytes = all_objects_to_delete
+            let total_objects_delete: usize = all_stats
                 .iter()
-                .fold(0, |acc, object| acc + object.size.unwrap_or(0) as u64);
+                .fold(0, |acc, stats| acc + stats.total_files_delete);
+
+            let total_delete_bytes: usize = all_stats
+                .iter()
+                .fold(0, |acc, stats| acc + stats.delete_size);
 
             event!(
                 Level::INFO,
                 "Total files to delete: {} for a total of {}",
-                all_objects_to_delete.len(),
-                ByteSize(total_delete_bytes)
+                total_objects_delete,
+                ByteSize(total_delete_bytes as u64)
             );
         }
     }
@@ -438,13 +392,17 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         }
     });
 
-    event!(
-        Level::INFO,
-        "Sync took {:?} for {} ({}/s)",
-        elapsed,
-        ByteSize(synchronization_size as u64),
-        ByteSize((synchronization_size as f64 / elapsed.as_secs_f64()) as u64)
-    );
+    if dry_run {
+        event!(Level::INFO, "Dry run files diff took {:?}", elapsed,);
+    } else {
+        event!(
+            Level::INFO,
+            "Sync took {:?} for {} ({}/s)",
+            elapsed,
+            ByteSize(synchronization_size as u64),
+            ByteSize((synchronization_size as f64 / elapsed.as_secs_f64()) as u64)
+        );
+    }
 
     Ok(())
 }

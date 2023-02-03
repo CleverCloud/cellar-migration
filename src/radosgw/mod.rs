@@ -2,11 +2,12 @@ pub mod awscredentials;
 pub mod uploader;
 
 use std::{
-    collections::HashMap,
+    pin::Pin,
     str::FromStr,
     sync::{Arc, Mutex},
 };
 
+use anyhow::anyhow;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -17,17 +18,16 @@ use rusoto_s3::{
     CompletedMultipartUpload, CompletedPart, CreateBucketError, CreateBucketRequest,
     CreateMultipartUploadError, CreateMultipartUploadOutput, CreateMultipartUploadRequest,
     DeleteObjectError, DeleteObjectRequest, GetObjectError, GetObjectOutput, GetObjectRequest,
-    HeadObjectOutput, HeadObjectRequest, ListObjectsV2Request, Object, PutObjectError,
-    PutObjectOutput, PutObjectRequest, S3Client, UploadPartError, UploadPartOutput,
-    UploadPartRequest, S3,
+    HeadObjectOutput, HeadObjectRequest, ListObjectsV2Request, PutObjectError, PutObjectOutput,
+    PutObjectRequest, S3Client, UploadPartError, UploadPartOutput, UploadPartRequest, S3,
 };
 use tracing::{event, instrument, Level};
 
 use crate::provider::{
-    Provider, ProviderObject, ProviderObjectMetadata, ProviderObjects, ProviderResponse,
-    ProviderResponseStreamChunk,
+    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse, ProviderResponseStreamChunk,
 };
 
+const MAX_FETCH_KEYS: usize = 1000;
 const REQUESTS_MAX_RETRIES: usize = 5;
 
 #[derive(Debug, Clone)]
@@ -237,13 +237,11 @@ impl RadosGW {
     }
 
     #[instrument(skip(self), level = "trace")]
-    pub async fn list_objects(
+    async fn list_objects(
         &self,
-        max_results: Option<usize>,
-    ) -> anyhow::Result<HashMap<String, rusoto_s3::Object>> {
-        let mut results = HashMap::new();
-        let mut start_after = None;
-        let mut total_keys: i64 = 0;
+        max_results: Option<i64>,
+        start_after: Option<String>,
+    ) -> anyhow::Result<Vec<rusoto_s3::Object>> {
         // Keep track of retries
         let mut retries = 0;
 
@@ -259,15 +257,25 @@ impl RadosGW {
                     .clone()
                     .expect("list_objects should have a bucket"),
                 start_after: start_after.clone(),
-                max_keys: max_results.map(|max| std::cmp::min(max, 1000) as i64),
+                max_keys: max_results,
                 ..Default::default()
             };
 
             let client = self.get_client();
+            event!(
+                Level::TRACE,
+                "Sending ListObjectV2Request: {:x?}",
+                list_objects_request
+            );
             let objects = client
                 .list_objects_v2(list_objects_request.clone())
                 .await
                 .map(|res| res.contents.unwrap_or_default());
+            event!(
+                Level::TRACE,
+                "Got ListObjectV2Request result result: {:?}",
+                objects
+            );
 
             // If we get an HTTP error (timeout, connexion reset, ...), just retry
             if let Err(error) = objects {
@@ -279,51 +287,28 @@ impl RadosGW {
                     }
                     _ => return Err(anyhow::Error::from(error)),
                 }
-            } else {
-                retries = 0;
             }
 
             let objects = objects.unwrap();
 
-            if objects.is_empty() {
-                break;
-            }
-
             event!(Level::TRACE, "{:?}", objects.last());
 
-            total_keys += objects.len() as i64;
-
-            start_after = objects.last().and_then(|o| o.key.clone());
-
-            for object in objects {
-                results.insert(
-                    object.key.clone().expect("Object should have a key"),
-                    object,
-                );
-            }
-
-            if let Some(max_results) = max_results {
-                if total_keys >= max_results as i64 {
-                    break;
-                }
-            }
+            return Ok(objects);
         }
-
-        Ok(results)
     }
 
     #[instrument(skip(self), level = "debug")]
     pub async fn delete_object(
         &self,
-        object: Object,
-    ) -> Result<Object, RusotoError<DeleteObjectError>> {
+        object: ProviderObject,
+    ) -> Result<ProviderObject, RusotoError<DeleteObjectError>> {
         let client = self.get_client();
         let delete_object_request = DeleteObjectRequest {
             bucket: self
                 .bucket
                 .clone()
                 .expect("delete_object should have a bucket"),
-            key: object.key.clone().unwrap(),
+            key: object.get_key(),
             ..Default::default()
         };
 
@@ -508,13 +493,60 @@ impl Provider for RadosGW {
                 .collect()
         })
     }
-    async fn list_objects(&self, max_keys: Option<usize>) -> anyhow::Result<ProviderObjects> {
-        self.list_objects(max_keys).await.map(|result| {
-            result
-                .iter()
-                .map(|(key, object)| (key.clone(), object.into()))
-                .collect()
-        })
+    #[instrument(skip(self), level = "debug")]
+    fn list_objects(
+        &self,
+        max_keys: Option<usize>,
+        start_after: Option<String>,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<Vec<ProviderObject>>> + '_>> {
+        Box::pin(futures::stream::unfold(
+            (start_after, 0),
+            move |(start_after, total_keys)| async move {
+                let max_results = max_keys
+                    .map(|max| {
+                        if total_keys + MAX_FETCH_KEYS > max {
+                            max - total_keys
+                        } else {
+                            MAX_FETCH_KEYS
+                        }
+                    })
+                    .unwrap_or(MAX_FETCH_KEYS);
+                event!(
+                    Level::DEBUG,
+                    "Listing objects (bucket={:?}): start_after={:?}, max_results={:?}, total_keys={}",
+                    self.bucket,
+                    start_after,
+                    max_results,
+                    total_keys
+                );
+
+                let objects: anyhow::Result<Vec<ProviderObject>> = self
+                    .list_objects(Some(max_results as i64), start_after.clone())
+                    .await
+                    .map(|res| res.iter().map(|object| object.into()).collect());
+
+                event!(
+                    Level::DEBUG,
+                    "Listing objects (bucket={:?}): Got {:?}",
+                    self.bucket,
+                    objects.as_ref().map(|r| format!("len={}", r.len()))
+                );
+
+                match objects {
+                    Ok(objects) => {
+                        if objects.is_empty() {
+                            None
+                        } else {
+                            let last_key = objects.last().unwrap().get_key();
+
+                            let len = objects.len();
+                            Some((Ok(objects), (Some(last_key), total_keys + len)))
+                        }
+                    }
+                    Err(error) => Some((Err(anyhow!(error)), (start_after, total_keys))),
+                }
+            },
+        ))
     }
     async fn get_object_metadata(
         &self,

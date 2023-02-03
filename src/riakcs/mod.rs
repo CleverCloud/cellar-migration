@@ -1,6 +1,6 @@
 pub mod dto;
 
-use std::collections::HashMap;
+use std::pin::Pin;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -8,6 +8,7 @@ use base64::Engine;
 use bytes::{BufMut, BytesMut};
 use chrono::{DateTime, Duration, Utc};
 use dto::{ListObjectResponse, ObjectContents};
+use futures::Stream;
 use hyper::{body::HttpBody, Body, Client, Method, Response, StatusCode};
 use hyper_tls::HttpsConnector;
 use ring::hmac;
@@ -17,7 +18,7 @@ use tracing::{event, instrument, Level};
 
 use crate::{
     provider::{
-        Provider, ProviderObject, ProviderObjectMetadata, ProviderObjects, ProviderResponse,
+        Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse,
         ProviderResponseStreamChunk,
     },
     radosgw::uploader::RiakResponseStream,
@@ -215,9 +216,9 @@ impl RiakCS {
     pub async fn list_objects(
         &self,
         max_keys: Option<usize>,
-    ) -> Result<HashMap<String, ObjectContents>> {
-        let mut results = HashMap::new();
-        let mut marker: Option<String> = None;
+        mut marker: Option<String>,
+    ) -> Result<Vec<ObjectContents>> {
+        let mut results = Vec::new();
         loop {
             let uri = format!(
                 "{}?max-keys={}{}",
@@ -240,11 +241,9 @@ impl RiakCS {
 
             let response: ListObjectResponse = self.send_request_deser(req).await?;
 
-            let objects = response.get_objects();
+            let mut objects = response.get_objects();
             let last_object = objects.last().map(|o| o.get_key());
-            for object in objects {
-                results.insert(object.get_key(), object);
-            }
+            results.append(&mut objects);
 
             if response.truncated() {
                 marker = last_object;
@@ -392,13 +391,32 @@ impl Provider for RiakCS {
         Ok(buckets)
     }
 
-    async fn list_objects(&self, max_keys: Option<usize>) -> Result<ProviderObjects> {
-        self.list_objects(max_keys).await.map(|objects| {
-            objects
-                .iter()
-                .map(|(key, value)| (key.to_owned(), value.into()))
-                .collect()
-        })
+    fn list_objects(
+        &self,
+        max_keys: Option<usize>,
+        start_after: Option<String>,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<Vec<ProviderObject>>> + '_>> {
+        Box::pin(futures::stream::unfold(
+            start_after,
+            move |start_after| async move {
+                let objects: anyhow::Result<Vec<ProviderObject>> = self
+                    .list_objects(max_keys, start_after.clone())
+                    .await
+                    .map(|res| res.iter().map(|object| object.into()).collect());
+
+                match objects {
+                    Ok(objects) => {
+                        if objects.is_empty() {
+                            None
+                        } else {
+                            let last_object = objects.last().unwrap().get_key();
+                            Some((Ok(objects), Some(last_object)))
+                        }
+                    }
+                    Err(error) => Some((Err(anyhow::anyhow!(error)), start_after)),
+                }
+            },
+        ))
     }
 
     async fn get_object_metadata(

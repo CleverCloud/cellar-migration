@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fmt::Debug,
     pin::Pin,
     str::FromStr,
@@ -100,36 +100,20 @@ impl From<&rusoto_s3::Object> for ProviderObject {
     }
 }
 
-impl PartialEq<rusoto_s3::Object> for ProviderObject {
+impl PartialEq<ProviderObject> for ProviderObject {
     #[instrument(skip_all, level = "trace")]
-    fn eq(&self, other: &rusoto_s3::Object) -> bool {
+    fn eq(&self, other: &ProviderObject) -> bool {
         event!(Level::TRACE, "Self: {:#?}\nOther: {:#?}", self, other);
 
-        if other.key.as_ref() == Some(&self.key) && other.size == Some(self.get_size() as i64) {
-            if other.e_tag.as_ref() == Some(&self.etag) {
+        if other.key == self.key && other.size == self.get_size() {
+            if other.etag == self.etag {
                 true
             } else if self.get_etag().contains('-') {
                 event!(Level::WARN, "Object {} has been uploaded using multipart upload. Falling back to last modification date to compare objects.", self.get_key());
-                let other_date: Option<DateTime<Utc>> = other
-                    .last_modified
-                    .as_ref()
-                    .and_then(|date| DateTime::from_str(date).ok());
-                if let Some(other_date) = other_date {
-                    self.last_modified < other_date
-                } else {
-                    false
-                }
-            } else if other.e_tag.as_ref().unwrap_or(&String::new()).contains('-') {
+                self.last_modified < other.last_modified
+            } else if other.etag.contains('-') {
                 event!(Level::WARN, "Object {} has been uploaded without multipart on source bucket but with multipart on destination bucket. Falling back to last modification date to compare objects.", self.get_key());
-                let other_date: Option<DateTime<Utc>> = other
-                    .last_modified
-                    .as_ref()
-                    .and_then(|date| DateTime::from_str(date).ok());
-                if let Some(other_date) = other_date {
-                    self.last_modified < other_date
-                } else {
-                    false
-                }
+                self.last_modified < other.last_modified
             } else {
                 false
             }
@@ -138,8 +122,6 @@ impl PartialEq<rusoto_s3::Object> for ProviderObject {
         }
     }
 }
-
-pub type ProviderObjects = HashMap<String, ProviderObject>;
 
 #[derive(Debug)]
 pub struct ProviderObjectMetadata {
@@ -257,7 +239,11 @@ impl dyn ProviderResponse {
 #[async_trait]
 pub trait Provider: Debug + DynClone + Send + Sync {
     async fn get_buckets(&self) -> anyhow::Result<Vec<String>>;
-    async fn list_objects(&self, max_keys: Option<usize>) -> anyhow::Result<ProviderObjects>;
+    fn list_objects(
+        &self,
+        max_keys: Option<usize>,
+        start_after: Option<String>,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<Vec<ProviderObject>>> + '_>>;
     async fn get_object_metadata(
         &self,
         object: &ProviderObject,
@@ -270,33 +256,48 @@ pub trait Provider: Debug + DynClone + Send + Sync {
 
 dyn_clone::clone_trait_object!(Provider);
 
-pub fn get_provider(provider: &str, conf: ProviderConf) -> Box<dyn Provider> {
+#[derive(Debug, Clone)]
+pub enum Providers {
+    RiakCS,
+    Cellar,
+    AwsS3,
+}
+
+impl TryFrom<&str> for Providers {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "riak-cs" => Ok(Providers::RiakCS),
+            "cellar" => Ok(Providers::Cellar),
+            "aws-s3" => Ok(Providers::AwsS3),
+            _ => Err(format!("Failed to parse provider name: {}", value)),
+        }
+    }
+}
+
+pub fn get_provider(provider: &Providers, conf: ProviderConf) -> Box<dyn Provider> {
     match provider {
-        "riak-cs" => Box::new(RiakCS::new(
+        Providers::RiakCS => Box::new(RiakCS::new(
             conf.endpoint
                 .expect("RiakCS requires an endpoint and not a region"),
             conf.access_key,
             conf.secret_key,
             conf.bucket,
         )),
-        "cellar" => Box::new(RadosGW::new(
+        Providers::Cellar => Box::new(RadosGW::new(
             conf.endpoint,
             None,
             conf.access_key,
             conf.secret_key,
             conf.bucket,
         )),
-        "aws-s3" => Box::new(RadosGW::new(
+        Providers::AwsS3 => Box::new(RadosGW::new(
             None,
             conf.region,
             conf.access_key,
             conf.secret_key,
             conf.bucket,
         )),
-        p => {
-            event!(Level::ERROR, "Unknown provider {}", p);
-            unreachable!();
-        }
     }
 }
 

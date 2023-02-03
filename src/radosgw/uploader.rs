@@ -19,9 +19,11 @@ use crate::provider::{
 
 use super::RadosGW;
 
+pub type ObjectMigrationSize = usize;
+
 pub struct ThreadMigrationResult {
-    pub sync_results: Vec<anyhow::Result<ProviderObject>>,
-    pub delete_results: Vec<anyhow::Result<rusoto_s3::Object>>,
+    pub sync_results: Vec<anyhow::Result<ObjectMigrationSize>>,
+    pub delete_results: Vec<anyhow::Result<ObjectMigrationSize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,7 +31,7 @@ pub struct Uploader {
     source_provider_client: Box<dyn Provider>,
     radosgw_client: RadosGW,
     objects: Arc<Mutex<VecDeque<ProviderObject>>>,
-    objects_to_delete: Arc<Mutex<VecDeque<rusoto_s3::Object>>>,
+    objects_to_delete: Arc<Mutex<VecDeque<ProviderObject>>>,
     threads: usize,
     multipart_chunk_size: usize,
 }
@@ -39,7 +41,7 @@ impl Uploader {
         source_provider_client: Box<dyn Provider>,
         radosgw_client: RadosGW,
         objects: Vec<ProviderObject>,
-        objects_to_delete: Vec<rusoto_s3::Object>,
+        objects_to_delete: Vec<ProviderObject>,
         threads: usize,
         multipart_chunk_size: usize,
     ) -> Uploader {
@@ -103,7 +105,7 @@ impl Uploader {
                             multipart_chunk_size,
                         )
                         .await
-                        .map(|_| object);
+                        .map(|_| object.get_size() as usize);
 
                         results.push(result);
                     } else {
@@ -121,7 +123,7 @@ impl Uploader {
                                 thread_id,
                                 total_files_to_delete - remaining,
                                 total_files_to_delete,
-                                object_to_delete.key.as_ref().unwrap()
+                                object_to_delete.get_key()
                             );
 
                             let result = Uploader::delete_destination_object(
@@ -129,7 +131,8 @@ impl Uploader {
                                 object_to_delete,
                                 thread_id,
                             )
-                            .await;
+                            .await
+                            .map(|object| object.get_size() as usize);
 
                             delete_results.push(result);
                         } else {
@@ -367,14 +370,14 @@ impl Uploader {
 
     pub async fn delete_destination_object(
         radosgw_client: &RadosGW,
-        object: rusoto_s3::Object,
+        object: ProviderObject,
         thread_id: usize,
-    ) -> anyhow::Result<rusoto_s3::Object> {
+    ) -> anyhow::Result<ProviderObject> {
         event!(
             Level::DEBUG,
             "Thread {} | Delete object {}",
             thread_id,
-            object.key.as_ref().unwrap()
+            object.get_key()
         );
 
         radosgw_client

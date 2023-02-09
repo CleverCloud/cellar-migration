@@ -563,5 +563,5 @@ pub async fn create_destination_buckets(
 
 fn bucket_already_created(bucket: &str) {
     event!(Level::ERROR, "Bucket {} | Bucket can't be created because it probably has been created in another Cellar add-on, maybe by another user.", bucket);
-    event!(Level::ERROR, "Please refer to https://github.com/CleverCloud/cellar-c1-migration-tool/#my-bucket-already-exists-on-the-destination-cluster to find a workaround");
+    event!(Level::ERROR, "Please refer to https://github.com/CleverCloud/cellar-migration/#my-bucket-already-exists-on-the-destination-cluster to find a workaround");
 }

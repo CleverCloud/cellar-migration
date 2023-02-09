@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         .arg_required_else_help(true)
         .subcommand(
             Command::new("migrate")
-            .about("Migrate a cellar-c1 bucket to a cellar-c2 cluster. By default, it will dry run unless --execute is passed")
+            .about("Migrate a bucket to a Cellar cluster. By default, it will dry run unless --execute is passed")
             .arg(Arg::new("source-bucket").long("source-bucket").help("Source bucket from which files will be copied. If omitted, all buckets of the add-on will be synchronized"))
             .arg(Arg::new("source-access-key").long("source-access-key").help("Source bucket Cellar access key").required(true))
             .arg(Arg::new("source-secret-key").long("source-secret-key").help("Source bucket Cellar secret key").required(true))

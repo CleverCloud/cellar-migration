@@ -8,12 +8,12 @@ It is best to run it on a machine with a high network bandwidth.
 
 ## Installation
 
-You can download pre-built binaries in the [Releases section](https://github.com/CleverCloud/cellar-c1-migration-tool/releases). Supported platforms are Linux, Mac OS and Windows.
+You can download pre-built binaries in the [Releases section](https://github.com/CleverCloud/cellar-migration/releases). Supported platforms are Linux, Mac OS and Windows.
 
 If your platform isn't supported or you prefer to compile it yourself, you can install [Rust](https://www.rust-lang.org/) and run as your regular user:
 
 ```
-cargo install --git https://github.com/CleverCloud/cellar-c1-migration-tool --tag v1.2.2
+cargo install --git https://github.com/CleverCloud/cellar-migration --tag v1.2.2
 ```
 
 It should then install the binary in `$HOME/.cargo/bin`.

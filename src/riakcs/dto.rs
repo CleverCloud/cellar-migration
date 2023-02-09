@@ -4,7 +4,6 @@ use chrono::{DateTime, FixedOffset, Utc};
 use hyper::{Body, Response};
 
 use serde_derive::Deserialize;
-use tracing::{event, instrument, Level};
 
 #[derive(Debug, Deserialize, PartialEq, Clone)]
 pub struct ObjectContents {
@@ -62,45 +61,6 @@ impl ListObjectResponse {
     }
 }
 
-impl PartialEq<rusoto_s3::Object> for ObjectContents {
-    #[instrument(skip_all, level = "trace")]
-    fn eq(&self, other: &rusoto_s3::Object) -> bool {
-        event!(Level::TRACE, "Self: {:#?}\nOther: {:#?}", self, other);
-
-        if other.key == Some(self.get_key()) && other.size == Some(self.get_size() as i64) {
-            if other.e_tag == Some(self.get_etag()) {
-                true
-            } else if self.get_etag().contains('-') {
-                event!(Level::WARN, "Object {} has been uploaded using multipart upload. Falling back to last modification date to compare objects.", self.get_key());
-                let other_date: Option<DateTime<Utc>> = other
-                    .last_modified
-                    .as_ref()
-                    .and_then(|date| DateTime::from_str(date).ok());
-                if let Some(other_date) = other_date {
-                    self.get_last_modified() < other_date
-                } else {
-                    false
-                }
-            } else if other.e_tag.as_ref().unwrap_or(&String::new()).contains('-') {
-                event!(Level::WARN, "Object {} has been uploaded without multipart on source bucket but with multipart on destination bucket. Falling back to last modification date to compare objects.", self.get_key());
-                let other_date: Option<DateTime<Utc>> = other
-                    .last_modified
-                    .as_ref()
-                    .and_then(|date| DateTime::from_str(date).ok());
-                if let Some(other_date) = other_date {
-                    self.get_last_modified() < other_date
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ObjectMetadataResponse {
     pub acl_public: bool,
@@ -150,7 +110,7 @@ impl From<Response<Body>> for ObjectMetadata {
                 )
                 .expect("Last Modified header should be a valid UTC date")
             }),
-            etag: Self::extract_header(&response, "etag").map(|etag| etag.replace("\"", "")),
+            etag: Self::extract_header(&response, "etag").map(|etag| etag.replace('\"', "")),
             content_type: Self::extract_header(&response, "content-type"),
             content_length: Self::extract_header(&response, "content-length")
                 .map(|ct| {
@@ -188,6 +148,6 @@ pub struct ListBucketsResult {
 
 impl ListBucketsResult {
     pub fn get_buckets(&self) -> Vec<ListBucket> {
-        self.buckets.bucket.clone().unwrap_or_else(Vec::new)
+        self.buckets.bucket.clone().unwrap_or_default()
     }
 }

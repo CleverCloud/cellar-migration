@@ -6,41 +6,42 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use hyper::body::HttpBody;
 use rusoto_core::ByteStream;
 use tokio::task::JoinError;
 use tracing::event;
 use tracing::Level;
 
-use crate::riakcs::{
-    dto::{ObjectContents, ObjectMetadataResponse},
-    RiakCS,
+use crate::provider::{
+    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponseStreamChunkWrapper,
 };
 
 use super::RadosGW;
 
+pub type ObjectMigrationSize = usize;
+
 pub struct ThreadMigrationResult {
-    pub sync_results: Vec<anyhow::Result<ObjectContents>>,
-    pub delete_results: Vec<anyhow::Result<rusoto_s3::Object>>,
+    pub sync_results: Vec<anyhow::Result<ObjectMigrationSize>>,
+    pub delete_results: Vec<anyhow::Result<ObjectMigrationSize>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Uploader {
-    riak_client: RiakCS,
+    source_provider_client: Box<dyn Provider>,
     radosgw_client: RadosGW,
-    objects: Arc<Mutex<VecDeque<ObjectContents>>>,
-    objects_to_delete: Arc<Mutex<VecDeque<rusoto_s3::Object>>>,
+    objects: Arc<Mutex<VecDeque<ProviderObject>>>,
+    objects_to_delete: Arc<Mutex<VecDeque<ProviderObject>>>,
     threads: usize,
     multipart_chunk_size: usize,
 }
 
 impl Uploader {
     pub fn new(
-        riak_client: RiakCS,
+        source_provider_client: Box<dyn Provider>,
         radosgw_client: RadosGW,
-        objects: Vec<ObjectContents>,
-        objects_to_delete: Vec<rusoto_s3::Object>,
+        objects: Vec<ProviderObject>,
+        objects_to_delete: Vec<ProviderObject>,
         threads: usize,
         multipart_chunk_size: usize,
     ) -> Uploader {
@@ -54,7 +55,7 @@ impl Uploader {
         }
 
         Uploader {
-            riak_client,
+            source_provider_client,
             radosgw_client,
             objects: Arc::new(Mutex::new(VecDeque::from(objects))),
             objects_to_delete: Arc::new(Mutex::new(VecDeque::from(objects_to_delete))),
@@ -70,7 +71,7 @@ impl Uploader {
         let total_files_to_delete = self.objects_to_delete.clone().lock().unwrap().len();
 
         for thread_id in 0..self.threads {
-            let riak_client = self.riak_client.clone();
+            let riak_client = self.source_provider_client.clone();
             let radosgw_client = self.radosgw_client.clone();
             let files = self.objects.clone();
             let files_to_delete = self.objects_to_delete.clone();
@@ -97,14 +98,14 @@ impl Uploader {
                         );
 
                         let result = Uploader::sync_object(
-                            &riak_client,
+                            &*riak_client,
                             &radosgw_client,
                             &object,
                             thread_id,
                             multipart_chunk_size,
                         )
                         .await
-                        .map(|_| object);
+                        .map(|_| object.get_size() as usize);
 
                         results.push(result);
                     } else {
@@ -122,7 +123,7 @@ impl Uploader {
                                 thread_id,
                                 total_files_to_delete - remaining,
                                 total_files_to_delete,
-                                object_to_delete.key.as_ref().unwrap()
+                                object_to_delete.get_key()
                             );
 
                             let result = Uploader::delete_destination_object(
@@ -130,7 +131,8 @@ impl Uploader {
                                 object_to_delete,
                                 thread_id,
                             )
-                            .await;
+                            .await
+                            .map(|object| object.get_size() as usize);
 
                             delete_results.push(result);
                         } else {
@@ -157,20 +159,20 @@ impl Uploader {
     }
 
     pub async fn sync_object(
-        riak_client: &RiakCS,
+        source_provider_client: &dyn Provider,
         radosgw_client: &RadosGW,
-        object: &ObjectContents,
+        object: &ProviderObject,
         thread_id: usize,
         multipart_chunk_size: usize,
     ) -> anyhow::Result<()> {
-        let object_metadata = riak_client.get_object_metadata(object).await?;
-        let mut response = riak_client.get_object(object).await?;
-        if response.status().is_success() {
+        let object_metadata = source_provider_client.get_object_metadata(object).await?;
+        let mut response = source_provider_client.get_object(object).await?;
+        if response.success() {
             let start = std::time::Instant::now();
             let object_size = object.get_size() as usize;
 
             if object_size < multipart_chunk_size {
-                let body = ByteStream::new(RiakResponseStream::new(response));
+                let body = ByteStream::new(response.body());
                 Uploader::sync_object_singlepart(
                     radosgw_client,
                     object,
@@ -180,15 +182,12 @@ impl Uploader {
                 )
                 .await?;
             } else {
-                let body = RiakResponseStreamChunk::new(
-                    RiakResponseStream::new(response),
-                    multipart_chunk_size,
-                );
+                let body = response.body_chunked(multipart_chunk_size);
                 Uploader::sync_object_multipart(
                     radosgw_client,
                     object,
                     &object_metadata,
-                    body,
+                    Box::pin(body),
                     multipart_chunk_size,
                     thread_id,
                 )
@@ -202,22 +201,22 @@ impl Uploader {
                 start.elapsed()
             );
             Ok(())
-        } else if let Some(body) = response.body_mut().data().await {
+        } else if let Some(body) = response.consume_body().await {
             match body {
                 Ok(bytes) => Err(anyhow::Error::from(DownloadError {
-                    code: response.status().as_u16(),
+                    code: response.status(),
                     message: Some(String::from_utf8_lossy(&bytes).to_string()),
                     object: object.clone(),
                 })),
                 Err(error) => Err(anyhow::Error::from(DownloadError {
-                    code: response.status().as_u16(),
+                    code: response.status(),
                     message: Some(format!("{:#?}", error)),
                     object: object.clone(),
                 })),
             }
         } else {
             Err(anyhow::Error::from(DownloadError {
-                code: response.status().as_u16(),
+                code: response.status(),
                 message: None,
                 object: object.clone(),
             }))
@@ -226,8 +225,8 @@ impl Uploader {
 
     pub async fn sync_object_singlepart(
         radosgw_client: &RadosGW,
-        object: &ObjectContents,
-        object_metadata: &ObjectMetadataResponse,
+        object: &ProviderObject,
+        object_metadata: &ProviderObjectMetadata,
         body: ByteStream,
         thread_id: usize,
     ) -> anyhow::Result<()> {
@@ -260,9 +259,9 @@ impl Uploader {
 
     pub async fn sync_object_multipart(
         radosgw_client: &RadosGW,
-        object: &ObjectContents,
-        object_metadata: &ObjectMetadataResponse,
-        body: RiakResponseStreamChunk,
+        object: &ProviderObject,
+        object_metadata: &ProviderObjectMetadata,
+        body: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
         multipart_chunk_size: usize,
         thread_id: usize,
     ) -> anyhow::Result<()> {
@@ -296,7 +295,9 @@ impl Uploader {
                 .put_object_part(
                     object.get_key(),
                     part_size as i64,
-                    ByteStream::new(RiakResponseStreamChunkWrapper::new(body_wrapper.clone())),
+                    ByteStream::new(ProviderResponseStreamChunkWrapper::new(
+                        body_wrapper.clone(),
+                    )),
                     multipart_upload_id.clone(),
                     radosgw_part_number as i64,
                 )
@@ -369,14 +370,14 @@ impl Uploader {
 
     pub async fn delete_destination_object(
         radosgw_client: &RadosGW,
-        object: rusoto_s3::Object,
+        object: ProviderObject,
         thread_id: usize,
-    ) -> anyhow::Result<rusoto_s3::Object> {
+    ) -> anyhow::Result<ProviderObject> {
         event!(
             Level::DEBUG,
             "Thread {} | Delete object {}",
             thread_id,
-            object.key.as_ref().unwrap()
+            object.get_key()
         );
 
         radosgw_client
@@ -390,7 +391,7 @@ impl Uploader {
 pub struct DownloadError {
     pub code: u16,
     pub message: Option<String>,
-    pub object: ObjectContents,
+    pub object: ProviderObject,
 }
 
 impl std::error::Error for DownloadError {
@@ -436,134 +437,5 @@ impl Stream for RiakResponseStream {
                 error.to_string(),
             )))),
         }
-    }
-}
-
-#[derive(Debug)]
-pub enum RiakResponseStreamChunkState {
-    Active,
-    Ended,
-    Error(std::io::Error),
-}
-
-/// This structure exists because when we give a part to upload to rusoto
-/// it will read until the end of the stream to end the part instead of just reading what the part's size
-/// This structure simulates that, encapsulates the RiakResponseStream and keep an internal state on when to end the stream
-/// because a part has been fully read.
-pub struct RiakResponseStreamChunk {
-    response: RiakResponseStream,
-    chunk_size: usize,
-    chunks: VecDeque<Bytes>,
-    returned_bytes: usize,
-    state: RiakResponseStreamChunkState,
-}
-
-impl RiakResponseStreamChunk {
-    pub fn new(response: RiakResponseStream, chunk_size: usize) -> RiakResponseStreamChunk {
-        RiakResponseStreamChunk {
-            response,
-            chunk_size,
-            chunks: VecDeque::new(),
-            returned_bytes: 0,
-            state: RiakResponseStreamChunkState::Active,
-        }
-    }
-}
-
-impl Stream for RiakResponseStreamChunk {
-    type Item = Result<Bytes, std::io::Error>;
-
-    #[allow(clippy::branches_sharing_code)]
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        event!(Level::TRACE, "RiakResponseStreamChunk: poll_next, chunk_size={}, chunks_len={}, returned_bytes={}, state={:?}", self.chunk_size, self.chunks.len(), self.returned_bytes, self.state);
-        if let RiakResponseStreamChunkState::Error(err) = &self.state {
-            return Poll::Ready(Some(Err(std::io::Error::new(err.kind(), err.to_string()))));
-        }
-
-        match Pin::new(&mut self.response).poll_next(cx) {
-            Poll::Ready(None) => {
-                event!(
-                    Level::TRACE,
-                    "RiakResponseStreamChunk poll: got EOF from riak"
-                );
-                self.state = RiakResponseStreamChunkState::Ended;
-            }
-            Poll::Ready(Some(Ok(bytes))) => {
-                event!(
-                    Level::TRACE,
-                    "RiakResponseStreamChunk: Got new chunk of length: {}",
-                    bytes.len()
-                );
-                self.chunks.push_back(bytes);
-            }
-            Poll::Ready(Some(Err(error))) => {
-                event!(
-                    Level::TRACE,
-                    "RiakResponseStreamChunk: Got error from stream, {:?}",
-                    error
-                );
-                self.state = RiakResponseStreamChunkState::Error(error);
-            }
-            Poll::Pending => {}
-        };
-
-        if self.returned_bytes == self.chunk_size {
-            event!(Level::TRACE, "RiakResponseStreamChunk: our stream has returned all needed bytes for now. Reset returned_bytes to 0.");
-            self.returned_bytes = 0;
-        }
-
-        if !self.chunks.is_empty() {
-            event!(
-                Level::TRACE,
-                "RiakResponseStreamChunk: we have some chunks ({}) to return. returned_bytes={}",
-                self.chunks.len(),
-                self.returned_bytes
-            );
-            let mut chunk = self.chunks.pop_front().unwrap();
-            let diff = self.chunk_size - self.returned_bytes;
-            event!(
-                Level::TRACE,
-                "RiakResponseStreamChunk: current chunk len={}, diff={}",
-                chunk.len(),
-                diff
-            );
-            if diff > chunk.len() {
-                self.returned_bytes += chunk.len();
-                event!(Level::TRACE, "RiakResponseStreamChunk: chunk is smaller than needed diff, returning it. returned_bytes={}", self.returned_bytes);
-                Poll::Ready(Some(Ok(chunk)))
-            } else {
-                let new_chunk = chunk.split_off(diff);
-                self.chunks.push_front(new_chunk);
-                self.returned_bytes += chunk.len();
-                event!(Level::TRACE, "RiakResponseStreamChunk: chunk is bigger than needed diff, only returning a portion. returned_bytes={}", self.returned_bytes);
-                Poll::Ready(Some(Ok(chunk)))
-            }
-        } else if let RiakResponseStreamChunkState::Ended = self.state {
-            self.returned_bytes = 0;
-            Poll::Ready(None)
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-/// This struct exists so we can share a single RiakResponseStreamChunk
-/// that will be fed to multiple ByteStream instances, without losing the
-/// ownership on the inner Stream.
-pub struct RiakResponseStreamChunkWrapper {
-    inner: Arc<Mutex<RiakResponseStreamChunk>>,
-}
-
-impl RiakResponseStreamChunkWrapper {
-    pub fn new(inner: Arc<Mutex<RiakResponseStreamChunk>>) -> RiakResponseStreamChunkWrapper {
-        RiakResponseStreamChunkWrapper { inner }
-    }
-}
-
-impl Stream for RiakResponseStreamChunkWrapper {
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.clone().lock().unwrap().poll_next_unpin(cx)
     }
 }

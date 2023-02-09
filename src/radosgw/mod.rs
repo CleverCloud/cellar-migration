@@ -1,25 +1,39 @@
 pub mod awscredentials;
 pub mod uploader;
 
-use std::collections::HashMap;
+use std::{
+    pin::Pin,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
+use anyhow::anyhow;
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use rusoto_core::{ByteStream, RusotoError};
 use rusoto_s3::{
     AbortMultipartUploadError, AbortMultipartUploadOutput, AbortMultipartUploadRequest, Bucket,
     CompleteMultipartUploadError, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
     CompletedMultipartUpload, CompletedPart, CreateBucketError, CreateBucketRequest,
     CreateMultipartUploadError, CreateMultipartUploadOutput, CreateMultipartUploadRequest,
-    DeleteObjectError, DeleteObjectRequest, ListBucketsError, ListObjectsV2Error,
-    ListObjectsV2Request, Object, PutObjectError, PutObjectOutput, PutObjectRequest, S3Client,
-    UploadPartError, UploadPartOutput, UploadPartRequest, S3,
+    DeleteObjectError, DeleteObjectRequest, GetObjectError, GetObjectOutput, GetObjectRequest,
+    HeadObjectOutput, HeadObjectRequest, ListObjectsV2Request, PutObjectError, PutObjectOutput,
+    PutObjectRequest, S3Client, UploadPartError, UploadPartOutput, UploadPartRequest, S3,
 };
 use tracing::{event, instrument, Level};
 
-use crate::riakcs::dto::ObjectMetadataResponse;
+use crate::provider::{
+    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse, ProviderResponseStreamChunk,
+};
+
+const MAX_FETCH_KEYS: usize = 1000;
+const REQUESTS_MAX_RETRIES: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct RadosGW {
-    endpoint: String,
+    endpoint: Option<String>,
+    region: Option<String>,
     access_key: String,
     secret_key: String,
     bucket: Option<String>,
@@ -27,13 +41,15 @@ pub struct RadosGW {
 
 impl RadosGW {
     pub fn new(
-        endpoint: String,
+        endpoint: Option<String>,
+        region: Option<String>,
         access_key: String,
         secret_key: String,
         bucket: Option<String>,
     ) -> RadosGW {
         RadosGW {
             endpoint,
+            region,
             access_key,
             secret_key,
             bucket,
@@ -47,22 +63,32 @@ impl RadosGW {
             self.secret_key.clone(),
         );
         let http_client = rusoto_core::HttpClient::new().unwrap();
-
-        S3Client::new_with(
-            http_client,
-            radosgw_credential_provider,
-            rusoto_core::Region::Custom {
-                name: "RadosGW".to_string(),
-                endpoint: self.endpoint.clone(),
+        let region = match (&self.endpoint, &self.region) {
+            // Can happen for other S3 like services
+            (Some(endpoint), Some(region)) => rusoto_core::Region::Custom {
+                name: region.clone(),
+                endpoint: endpoint.clone(),
             },
-        )
+            (Some(endpoint), None) => rusoto_core::Region::Custom {
+                name: "default".to_string(),
+                endpoint: endpoint.clone(),
+            },
+            (None, Some(region)) => {
+                rusoto_core::Region::from_str(region).expect("Region should be valid")
+            }
+            _ => unreachable!(),
+        };
+
+        event!(Level::DEBUG, "Using client with region: {:?}", region);
+
+        S3Client::new_with(http_client, radosgw_credential_provider, region)
     }
 
     #[instrument(skip(self), level = "debug")]
     pub async fn put_object(
         &self,
         key: String,
-        object_metadata: &ObjectMetadataResponse,
+        object_metadata: &ProviderObjectMetadata,
         size: i64,
         body: ByteStream,
     ) -> Result<PutObjectOutput, RusotoError<PutObjectError>> {
@@ -79,13 +105,13 @@ impl RadosGW {
             } else {
                 None
             },
-            cache_control: object_metadata.metadata.cache_control.clone(),
-            content_disposition: object_metadata.metadata.content_disposition.clone(),
-            content_encoding: object_metadata.metadata.content_encoding.clone(),
-            content_language: object_metadata.metadata.content_language.clone(),
-            content_md5: object_metadata.metadata.content_md5.clone(),
-            content_type: object_metadata.metadata.content_type.clone(),
-            expires: object_metadata.metadata.expires.clone(),
+            cache_control: object_metadata.cache_control.clone(),
+            content_disposition: object_metadata.content_disposition.clone(),
+            content_encoding: object_metadata.content_encoding.clone(),
+            content_language: object_metadata.content_language.clone(),
+            content_md5: object_metadata.content_md5.clone(),
+            content_type: object_metadata.content_type.clone(),
+            expires: object_metadata.expires.clone(),
             ..Default::default()
         };
 
@@ -97,7 +123,7 @@ impl RadosGW {
     pub async fn create_multipart_upload(
         &self,
         key: String,
-        object_metadata: &ObjectMetadataResponse,
+        object_metadata: &ProviderObjectMetadata,
     ) -> Result<CreateMultipartUploadOutput, RusotoError<CreateMultipartUploadError>> {
         let multipart_upload_request = CreateMultipartUploadRequest {
             key,
@@ -111,12 +137,12 @@ impl RadosGW {
                 None
             },
             // We don't have the content_md5 in this list but I don't think we really care
-            cache_control: object_metadata.metadata.cache_control.clone(),
-            content_disposition: object_metadata.metadata.content_disposition.clone(),
-            content_encoding: object_metadata.metadata.content_encoding.clone(),
-            content_language: object_metadata.metadata.content_language.clone(),
-            content_type: object_metadata.metadata.content_type.clone(),
-            expires: object_metadata.metadata.expires.clone(),
+            cache_control: object_metadata.cache_control.clone(),
+            content_disposition: object_metadata.content_disposition.clone(),
+            content_encoding: object_metadata.content_encoding.clone(),
+            content_language: object_metadata.content_language.clone(),
+            content_type: object_metadata.content_type.clone(),
+            expires: object_metadata.expires.clone(),
             ..Default::default()
         };
 
@@ -211,70 +237,78 @@ impl RadosGW {
     }
 
     #[instrument(skip(self), level = "trace")]
-    pub async fn list_objects(
+    async fn list_objects(
         &self,
         max_results: Option<i64>,
-    ) -> Result<HashMap<String, rusoto_s3::Object>, RusotoError<ListObjectsV2Error>> {
-        let mut results = HashMap::new();
-        let mut start_after = None;
-        let mut total_keys: i64 = 0;
+        start_after: Option<String>,
+    ) -> anyhow::Result<Vec<rusoto_s3::Object>> {
+        // Keep track of retries
+        let mut retries = 0;
 
         loop {
+            if retries > REQUESTS_MAX_RETRIES {
+                event!(Level::ERROR, "We've hit max retries when listing objects. Check warning logs for more details");
+                return Err(anyhow::anyhow!("MaxRetriesHit when listing objects"));
+            }
+
             let list_objects_request = ListObjectsV2Request {
                 bucket: self
                     .bucket
                     .clone()
                     .expect("list_objects should have a bucket"),
-                start_after,
-                max_keys: max_results.map(|max| std::cmp::min(max, 1000)),
+                start_after: start_after.clone(),
+                max_keys: max_results,
                 ..Default::default()
             };
 
             let client = self.get_client();
+            event!(
+                Level::TRACE,
+                "Sending ListObjectV2Request: {:x?}",
+                list_objects_request
+            );
             let objects = client
                 .list_objects_v2(list_objects_request.clone())
                 .await
-                .map(|res| res.contents.unwrap_or_default())?;
+                .map(|res| res.contents.unwrap_or_default());
+            event!(
+                Level::TRACE,
+                "Got ListObjectV2Request result result: {:?}",
+                objects
+            );
 
-            if objects.is_empty() {
-                break;
+            // If we get an HTTP error (timeout, connexion reset, ...), just retry
+            if let Err(error) = objects {
+                match error {
+                    RusotoError::HttpDispatch(_) => {
+                        event!(Level::WARN, "Got error when listing objects: {:?}", error);
+                        retries += 1;
+                        continue;
+                    }
+                    _ => return Err(anyhow::Error::from(error)),
+                }
             }
+
+            let objects = objects.unwrap();
 
             event!(Level::TRACE, "{:?}", objects.last());
 
-            total_keys += objects.len() as i64;
-
-            start_after = objects.last().and_then(|o| o.key.clone());
-
-            for object in objects {
-                results.insert(
-                    object.key.clone().expect("Object should have a key"),
-                    object,
-                );
-            }
-
-            if let Some(max_results) = max_results {
-                if total_keys >= max_results {
-                    break;
-                }
-            }
+            return Ok(objects);
         }
-
-        Ok(results)
     }
 
     #[instrument(skip(self), level = "debug")]
     pub async fn delete_object(
         &self,
-        object: Object,
-    ) -> Result<Object, RusotoError<DeleteObjectError>> {
+        object: ProviderObject,
+    ) -> Result<ProviderObject, RusotoError<DeleteObjectError>> {
         let client = self.get_client();
         let delete_object_request = DeleteObjectRequest {
             bucket: self
                 .bucket
                 .clone()
                 .expect("delete_object should have a bucket"),
-            key: object.key.clone().unwrap(),
+            key: object.get_key(),
             ..Default::default()
         };
 
@@ -285,11 +319,12 @@ impl RadosGW {
     }
 
     #[instrument(skip(self), level = "debug")]
-    pub async fn list_buckets(&self) -> Result<Vec<Bucket>, RusotoError<ListBucketsError>> {
+    pub async fn list_buckets(&self) -> anyhow::Result<Vec<Bucket>> {
         let client = self.get_client();
         client
             .list_buckets()
             .await
+            .map_err(anyhow::Error::from)
             .map(|result| result.buckets.unwrap_or_default())
     }
 
@@ -310,5 +345,230 @@ impl RadosGW {
             .create_bucket(create_bucket_request)
             .await
             .map(|_| ())
+    }
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_object_metadata(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<HeadObjectOutput> {
+        let client = self.get_client();
+
+        let head_object_request = HeadObjectRequest {
+            bucket: self
+                .bucket
+                .clone()
+                .expect("get_object_metadata should have a bucket"),
+            key: object.get_key(),
+            ..Default::default()
+        };
+
+        client
+            .head_object(head_object_request)
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "Error fetching object metadata {}: {:?}",
+                    object.get_key(),
+                    error
+                )
+            })
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_object(&self, object: &ProviderObject) -> anyhow::Result<GetObjectOutput> {
+        let client = self.get_client();
+
+        let get_object_request = GetObjectRequest {
+            bucket: self
+                .bucket
+                .clone()
+                .expect("get_object should have a bucket"),
+            key: object.get_key(),
+            ..Default::default()
+        };
+
+        client
+            .get_object(get_object_request)
+            .await
+            .map_err(|error| anyhow!("Error fetching object {}: {:?}", object.get_key(), error))
+    }
+}
+
+struct RadosGWResponseInner {
+    stream: ByteStream,
+}
+
+impl RadosGWResponseInner {
+    pub fn new(stream: ByteStream) -> RadosGWResponseInner {
+        RadosGWResponseInner { stream }
+    }
+}
+
+impl Stream for RadosGWResponseInner {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.stream.poll_next_unpin(cx)
+    }
+}
+
+#[derive(Debug)]
+pub struct RadosGWResponse {
+    response: Option<Arc<Mutex<GetObjectOutput>>>,
+    error: Option<anyhow::Error>,
+}
+
+impl RadosGWResponse {
+    pub fn new(response: Result<GetObjectOutput, anyhow::Error>) -> RadosGWResponse {
+        let (res, error) = match response {
+            Ok(res) => (Some(Arc::new(Mutex::new(res))), None),
+            Err(err) => (None, Some(err)),
+        };
+        RadosGWResponse {
+            response: res,
+            error,
+        }
+    }
+}
+
+impl ProviderResponse for RadosGWResponse {
+    fn status(&self) -> u16 {
+        match &self.error {
+            None => 200,
+            Some(err) => match err.downcast_ref::<GetObjectError>() {
+                Some(GetObjectError::NoSuchKey(_)) => 404,
+                Some(GetObjectError::InvalidObjectState(_)) => 500,
+                None => unreachable!("Failed to downcast to a GetObjetError"),
+            },
+        }
+    }
+
+    fn body(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>
+    {
+        match &self.error {
+            None => {
+                let response = self.response.take().expect("We should have a response");
+
+                let mut lock = response.lock().expect("Should lock");
+
+                match lock.body.take() {
+                    Some(body) => Box::pin(RadosGWResponseInner::new(body)),
+                    None => Box::pin(futures::stream::empty()),
+                }
+            }
+            Some(_) => Box::pin(futures::stream::empty()),
+        }
+    }
+
+    fn body_chunked(
+        &mut self,
+        chunk_size: usize,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>
+    {
+        match &self.error {
+            None => {
+                let response = self.response.take().expect("We should have a response");
+
+                let mut lock = response.lock().expect("Should lock");
+
+                match lock.body.take() {
+                    Some(body) => Box::pin(ProviderResponseStreamChunk::new(
+                        Box::pin(RadosGWResponseInner::new(body)),
+                        chunk_size,
+                    )),
+                    None => Box::pin(futures::stream::empty()),
+                }
+            }
+            Some(_) => Box::pin(futures::stream::empty()),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for RadosGW {
+    async fn get_buckets(&self) -> anyhow::Result<Vec<String>> {
+        self.list_buckets().await.map(|buckets| {
+            buckets
+                .iter()
+                .map(|b| b.name.clone().expect("Bucket should have a name"))
+                .collect()
+        })
+    }
+    #[instrument(skip(self), level = "debug")]
+    fn list_objects(
+        &self,
+        max_keys: Option<usize>,
+        start_after: Option<String>,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<Vec<ProviderObject>>> + '_>> {
+        Box::pin(futures::stream::unfold(
+            (start_after, 0),
+            move |(start_after, total_keys)| async move {
+                let max_results = max_keys
+                    .map(|max| {
+                        if total_keys + MAX_FETCH_KEYS > max {
+                            max - total_keys
+                        } else {
+                            MAX_FETCH_KEYS
+                        }
+                    })
+                    .unwrap_or(MAX_FETCH_KEYS);
+                event!(
+                    Level::DEBUG,
+                    "Listing objects (bucket={:?}): start_after={:?}, max_results={:?}, total_keys={}",
+                    self.bucket,
+                    start_after,
+                    max_results,
+                    total_keys
+                );
+
+                let objects: anyhow::Result<Vec<ProviderObject>> = self
+                    .list_objects(Some(max_results as i64), start_after.clone())
+                    .await
+                    .map(|res| res.iter().map(|object| object.into()).collect());
+
+                event!(
+                    Level::DEBUG,
+                    "Listing objects (bucket={:?}): Got {:?}",
+                    self.bucket,
+                    objects.as_ref().map(|r| format!("len={}", r.len()))
+                );
+
+                match objects {
+                    Ok(objects) => {
+                        if objects.is_empty() {
+                            None
+                        } else {
+                            let last_key = objects.last().unwrap().get_key();
+
+                            let len = objects.len();
+                            Some((Ok(objects), (Some(last_key), total_keys + len)))
+                        }
+                    }
+                    Err(error) => Some((Err(anyhow!(error)), (start_after, total_keys))),
+                }
+            },
+        ))
+    }
+    async fn get_object_metadata(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<ProviderObjectMetadata> {
+        self.get_object_metadata(object)
+            .await
+            .map(|response| response.into())
+    }
+    async fn get_object(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<Box<dyn ProviderResponse>> {
+        let object = self.get_object(object).await;
+
+        let x: Box<dyn ProviderResponse> = Box::new(RadosGWResponse::new(object));
+        Ok(x)
     }
 }

@@ -1,15 +1,20 @@
-use std::{collections::HashMap, error};
+use std::{cmp::Ordering, error};
 
-use futures::TryFutureExt;
+use bytesize::ByteSize;
+use futures::StreamExt;
 
 use rusoto_core::RusotoError;
 use rusoto_s3::{CreateBucketError, ListObjectsV2Error};
 use std::time::Duration;
+use tokio::task::JoinError;
 use tracing::{event, instrument, Level};
 
 use crate::{
-    radosgw::{uploader::Uploader, RadosGW},
-    riakcs::{dto::ObjectContents, RiakCS},
+    provider::{get_provider, ProviderConf, ProviderObject, Providers},
+    radosgw::{
+        uploader::{ThreadMigrationResult, Uploader},
+        RadosGW,
+    },
 };
 
 #[derive(Debug)]
@@ -17,8 +22,9 @@ pub struct BucketMigrationStats {
     pub bucket: String,
     pub synchronization_time: Duration,
     pub synchronization_size: usize,
-    pub objects: Vec<ObjectContents>,
-    pub objects_to_delete: Vec<rusoto_s3::Object>,
+    pub delete_size: usize,
+    pub total_files_sync: usize,
+    pub total_files_delete: usize,
 }
 
 #[derive(Debug)]
@@ -39,12 +45,14 @@ impl std::fmt::Display for BucketMigrationError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BucketMigrationConfiguration {
     pub source_bucket: String,
     pub source_access_key: String,
     pub source_secret_key: String,
-    pub source_endpoint: String,
+    pub source_endpoint: Option<String>,
+    pub source_region: Option<String>,
+    pub source_provider: Providers,
     pub destination_bucket: String,
     pub destination_access_key: String,
     pub destination_secret_key: String,
@@ -56,56 +64,37 @@ pub struct BucketMigrationConfiguration {
     pub dry_run: bool,
 }
 
-#[instrument(skip_all, level = "debug")]
-pub async fn migrate_bucket(
-    conf: BucketMigrationConfiguration,
-) -> anyhow::Result<BucketMigrationStats> {
-    let sync_start = std::time::Instant::now();
+pub enum BucketObjectsMigrationResult {
+    DryRun(Vec<ProviderObject>, Vec<ProviderObject>),
+    Executed(Vec<Result<ThreadMigrationResult, JoinError>>),
+}
 
-    let riak_client = RiakCS::new(
+#[instrument(skip_all, level = "debug")]
+async fn migrate_objects(
+    conf: BucketMigrationConfiguration,
+    src_objects: &[ProviderObject],
+    dst_objects: &[ProviderObject],
+) -> BucketObjectsMigrationResult {
+    let source_provider_conf = ProviderConf::new(
         conf.source_endpoint,
+        conf.source_region,
         conf.source_access_key,
         conf.source_secret_key,
         Some(conf.source_bucket.clone()),
     );
+    let source_provider = get_provider(&conf.source_provider, source_provider_conf);
 
     let radosgw_client = RadosGW::new(
-        conf.destination_endpoint,
+        Some(conf.destination_endpoint),
+        None,
         conf.destination_access_key,
         conf.destination_secret_key,
         Some(conf.destination_bucket),
     );
-
-    event!(Level::DEBUG, "riak client: {:#?}", riak_client);
-    event!(Level::DEBUG, "radosgw_client: {:#?}", radosgw_client);
-
-    let riak_objects_fut = riak_client.list_objects(conf.max_keys);
-    let radosgw_objects_fut = radosgw_client.list_objects(None).or_else(|error| {
-        async move {
-            match error {
-                RusotoError::Service(ListObjectsV2Error::NoSuchBucket(bucket)) => {
-                    if conf.dry_run {
-                        Ok(HashMap::new())
-                    } else {
-                        Err(anyhow::anyhow!("Unexpected error: Destination bucket {} doesn't exist but we tried to list its files", bucket))
-                    }
-                }
-                e => Err(anyhow::Error::from(e))
-            }
-        }
-    });
-
-    let objects_listing_result = futures::future::join(riak_objects_fut, radosgw_objects_fut).await;
-    let riak_objects = objects_listing_result.0?;
-    let radosgw_objects = objects_listing_result.1?;
-
-    event!(Level::DEBUG, "Riakcs objects: {}", riak_objects.len());
-    event!(Level::DEBUG, "Radosgw objects: {}", radosgw_objects.len());
-
-    let objects_to_migrate: Vec<ObjectContents> = riak_objects
+    let objects_to_migrate: Vec<ProviderObject> = src_objects
         .iter()
-        .filter_map(|(key, object)| {
-            if let Some(found) = radosgw_objects.get(key) {
+        .filter_map(|object| {
+            if let Some(found) = dst_objects.iter().find(|d| d.get_key() == object.get_key()) {
                 if object != found {
                     Some(object.clone())
                 } else {
@@ -117,11 +106,14 @@ pub async fn migrate_bucket(
         })
         .collect();
 
-    let objects_to_delete: Vec<rusoto_s3::Object> = if conf.delete_destination_files {
-        radosgw_objects
+    let objects_to_delete: Vec<ProviderObject> = if conf.delete_destination_files {
+        dst_objects
             .iter()
-            .filter_map(|(key, object)| {
-                if riak_objects.get(key).is_none() {
+            .filter_map(|object| {
+                if !src_objects
+                    .iter()
+                    .any(|src| src.get_key() == object.get_key())
+                {
                     Some(object.clone())
                 } else {
                     None
@@ -137,108 +129,335 @@ pub async fn migrate_bucket(
     if !conf.dry_run {
         if objects_to_sync > 0 {
             let mut uploader = Uploader::new(
-                riak_client,
+                source_provider,
                 radosgw_client,
-                objects_to_migrate.clone(),
-                objects_to_delete.clone(),
+                objects_to_migrate,
+                objects_to_delete,
                 conf.sync_threads,
                 conf.chunk_size,
             );
             let results = uploader.sync().await;
-            let results_errors: Vec<String> = results
-                .iter()
-                .flat_map(|join_result| {
-                    let thread_results = join_result.as_ref().unwrap();
+            BucketObjectsMigrationResult::Executed(results)
+        } else {
+            BucketObjectsMigrationResult::Executed(Vec::new())
+        }
+    } else {
+        BucketObjectsMigrationResult::DryRun(objects_to_migrate, objects_to_delete)
+    }
+}
 
-                    let sync_errors = thread_results
-                        .sync_results
-                        .iter()
-                        .filter_map(|result| {
-                            result.as_ref().err().map(|error| {
-                                format!(
-                                    "{} | Error synchronizing file: {:?}",
-                                    conf.source_bucket, error
+#[instrument(skip_all, level = "debug")]
+pub async fn migrate_bucket(
+    conf: BucketMigrationConfiguration,
+) -> anyhow::Result<BucketMigrationStats> {
+    let sync_start = std::time::Instant::now();
+
+    let async_conf = conf.clone();
+    let source_provider_conf = ProviderConf::new(
+        conf.source_endpoint,
+        conf.source_region,
+        conf.source_access_key,
+        conf.source_secret_key,
+        Some(conf.source_bucket.clone()),
+    );
+
+    let dest_provider_conf = ProviderConf::new(
+        Some(conf.destination_endpoint),
+        None,
+        conf.destination_access_key,
+        conf.destination_secret_key,
+        Some(conf.destination_bucket.clone()),
+    );
+
+    let source_provider = get_provider(&conf.source_provider, source_provider_conf);
+    let dest_provider = get_provider(&Providers::Cellar, dest_provider_conf);
+
+    let mut source_objects_stream = source_provider.list_objects(None, None);
+    let mut dest_listing = dest_provider.list_objects(None, None);
+
+    // Instead of listing all the files from each side and diff, fetch from both sides some files.
+    // From each fetch, check that the last source file is lesser than our last destination file
+    // If it is, we can start syncing the diff between the two
+    // If it is not, we keep fetching destination files until it is
+    // If we run out of destination files, it means we need to sync
+    async {
+        let mut sync_errors: Vec<anyhow::Error> = Vec::new();
+        let mut delete_errors: Vec<anyhow::Error> = Vec::new();
+        let mut total_synced_size: usize = 0;
+        let mut total_deleted_size: usize = 0;
+        let mut total_files_sync: usize = 0;
+        let mut total_files_delete: usize = 0;
+        let mut no_more_dst_objects = false;
+        let mut dst_objects: Vec<ProviderObject> = Vec::new();
+
+        while let Some(src_next) = source_objects_stream.next().await {
+            if let Err(err) = src_next {
+                event!(Level::ERROR, "Failed to fetch source objects: {:?}", err);
+                anyhow::bail!(err);
+            }
+
+            let src_objects = src_next.ok().unwrap();
+
+            event!(
+                Level::DEBUG,
+                "Migrate: Got source source_objects(len={}). delete_errors={}, total_synced_size={}, total_deleted_size={}, total_files_sync={}, total_files_delete={}, no_more_dst_objects={}, dst_objects={}",
+                src_objects.len(),
+                delete_errors.len(),
+                total_synced_size,
+                total_deleted_size,
+                total_files_sync,
+                total_files_delete,
+                no_more_dst_objects,
+                dst_objects.len()
+            );
+            event!(Level::TRACE, "Migrate: delete_errors: {:#?}", delete_errors);
+            event!(Level::TRACE, "Migrate: source objects: {:#?}", src_objects);
+            event!(Level::TRACE, "Migrate: dst_objects: {:#?}", dst_objects);
+
+            if let Some(last_src) = src_objects.last() {
+                let mut fetch_dst_objects = false;
+                'inner: loop {
+                    if no_more_dst_objects {
+                        break;
+                    }
+
+                    if let Some(last_dst) = dst_objects.last() {
+                        let order = last_src.get_key().cmp(&last_dst.get_key());
+                        event!(
+                            Level::DEBUG,
+                            "Last src object: {}, last dst object: {}. Ordering={:?}",
+                            last_src.get_key(),
+                            last_dst.get_key(),
+                            order
+                        );
+                        match order {
+                            // We have fetched more destination objects than source objects
+                            // So let's sync
+                            Ordering::Equal | Ordering::Less => {
+                                break 'inner;
+                            }
+                            // We haven't yet fetch enough objects on the dest side, continue
+                            Ordering::Greater => {
+                                fetch_dst_objects = true;
+                            },
+                        }
+                    } else if !no_more_dst_objects {
+                        fetch_dst_objects = true;
+                    }
+
+                    if fetch_dst_objects {
+                        match dest_listing.next().await {
+                            Some(Ok(objects)) => {
+                                fetch_dst_objects = false;
+                                dst_objects.extend(objects)
+                            },
+                            Some(Err(error)) => {
+                                match error.downcast_ref::<RusotoError<ListObjectsV2Error>>() {
+                                    Some(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(bucket))) => {
+                                        if conf.dry_run {
+                                            // This may be normal since the bucket may not exist yet
+                                            // treat it as empty
+                                            no_more_dst_objects = true;
+                                        } else {
+                                            unreachable!("We started migrating objects but dest bucket {} does not exist", bucket);
+                                        }
+                                    },
+                                    _ => {
+                                        event!(
+                                            Level::ERROR,
+                                            "Failed to fetch dest objects: {:?}",
+                                            error
+                                        );
+                                        anyhow::bail!(error);
+                                    }
+                                }
+                            }
+                            None => {
+                                no_more_dst_objects = true;
+                            }
+                        };
+                        continue;
+                    }
+                }
+
+                event!(Level::DEBUG, "Source objects: {}", src_objects.len());
+                event!(Level::DEBUG, "Destination objects: {}", dst_objects.len());
+
+                let migration_result =
+                    migrate_objects(async_conf.clone(), &src_objects, &dst_objects).await;
+
+                match migration_result {
+                    BucketObjectsMigrationResult::DryRun(to_migrate, to_delete) => {
+                        total_files_sync += to_migrate.len();
+
+                        to_migrate.iter().for_each(|object| {
+                            total_synced_size += object.get_size() as usize;
+                            event!(
+                                Level::INFO,
+                                "Object to sync : {}/{} - {}",
+                                async_conf.source_bucket,
+                                object.get_key(),
+                                ByteSize(object.get_size())
+                            );
+
+                        });
+
+                        event!(Level::INFO,
+                            "Current sync status: {} objects to sync for a total size of {}",
+                            total_files_sync,
+                            ByteSize(total_synced_size as u64)
+                        );
+
+                        if async_conf.delete_destination_files {
+                            total_files_delete += to_delete.len();
+                            to_delete.iter().for_each(|object| {
+                                event!(
+                                    Level::INFO,
+                                    "To delete on destination bucket: {}/{} - {}",
+                                    async_conf.destination_bucket,
+                                    object.get_key(),
+                                    ByteSize(object.get_size())
                                 )
-                            })
-                        })
-                        .collect::<Vec<String>>();
+                            });
 
-                    let delete_errors = thread_results
-                        .delete_results
-                        .iter()
-                        .filter_map(|result| {
-                            result.as_ref().err().map(|error| {
-                                format!(
-                                    "{} | Error deleting file on destination bucket: {:?}",
-                                    conf.source_bucket, error
-                                )
-                            })
-                        })
-                        .collect::<Vec<String>>();
+                            event!(Level::INFO,
+                                "Current delete status: {} objects to delete for a total size of {}",
+                                total_files_delete,
+                                ByteSize(total_deleted_size as u64)
+                            );
+                        }
+                    }
+                    BucketObjectsMigrationResult::Executed(mut results) => {
+                        while let Some(result) = results.pop() {
+                            let mut result = result.unwrap();
+                            total_files_sync += result.sync_results.len();
+                            total_files_delete += result.delete_results.len();
 
-                    [&sync_errors[..], &delete_errors[..]].concat()
-                })
-                .collect();
+                            event!(Level::TRACE, "Synced results: {:#?}", result.sync_results);
+                            event!(Level::TRACE, "Deleted results: {:#?}", result.delete_results);
 
-            if !results_errors.is_empty() {
-                let stats = BucketMigrationStats {
-                    bucket: conf.source_bucket.clone(),
-                    synchronization_time: sync_start.elapsed(),
-                    synchronization_size: results
-                        .iter()
-                        .flat_map(|join_result| {
-                            join_result
-                                .as_ref()
-                                .unwrap()
-                                .sync_results
-                                .iter()
-                                .filter(|result| result.is_ok())
-                                .map(|result| result.as_ref().unwrap())
-                                .collect::<Vec<&ObjectContents>>()
-                        })
-                        .fold(0, |acc, object| acc + object.get_size() as usize),
-                    objects: objects_to_migrate,
-                    objects_to_delete,
+                            while let Some(res) = result.sync_results.pop() {
+                                match res {
+                                    Ok(size) => total_synced_size += size,
+                                    Err(err) => {
+                                        event!(Level::WARN, "Failed to sync a file: {:?}", err);
+                                        sync_errors.push(anyhow::anyhow!(err));
+                                    }
+                                };
+                            }
+
+                            event!(Level::INFO,
+                                "Current sync status: {} synced objects for a total size of {}",
+                                total_files_sync,
+                                ByteSize(total_synced_size as u64)
+                            );
+
+                            if conf.delete_destination_files {
+                                while let Some(res) = result.delete_results.pop() {
+                                    match res {
+                                        Ok(size) => total_deleted_size += size,
+                                        Err(err) => {
+                                            event!(Level::WARN, "Failed to delete a file: {:?}", err);
+                                            delete_errors.push(anyhow::anyhow!(err));
+                                        }
+                                    };
+                                }
+
+                                event!(Level::INFO,
+                                    "Current delete status: {} deleted objects for a total size of {}",
+                                    total_files_delete,
+                                    ByteSize(total_deleted_size as u64)
+                                );
+                            }
+                        }
+                    }
                 };
 
-                Err(anyhow::Error::new(BucketMigrationError {
-                    errors: results_errors,
-                    stats,
-                }))
+                // Cleanup old dst objets already migrated
+                dst_objects.retain(|object| {
+                    !matches!(object.get_key().cmp(&last_src.get_key()), Ordering::Equal | Ordering::Less)
+                });
             } else {
+                // We don't have any more src objects to sync
+                unreachable!("We don't have any more src objects to sync");
+            }
+        }
+
+        if !conf.dry_run {
+            if total_files_sync > 0 {
+                let sync_errors = sync_errors
+                    .iter()
+                    .map(|error| {
+                        format!(
+                            "{} | Error synchronizing file: {:?}",
+                            conf.source_bucket, error
+                        )
+                    })
+                    .collect::<Vec<String>>();
+
+                let delete_errors = delete_errors
+                    .iter()
+                    .map(|error| {
+                        format!(
+                            "{} | Error deleting file on destination bucket: {:?}",
+                            conf.source_bucket, error
+                        )
+                    })
+                    .collect::<Vec<String>>();
+
+                let results_errors = vec![&sync_errors[..], &delete_errors[..]].concat();
+
+                if !results_errors.is_empty() {
+                    let stats = BucketMigrationStats {
+                        bucket: conf.source_bucket.clone(),
+                        synchronization_time: sync_start.elapsed(),
+                        synchronization_size: total_synced_size,
+                        delete_size: total_deleted_size,
+                        total_files_sync,
+                        total_files_delete,
+                    };
+
+                    Err(anyhow::Error::new(BucketMigrationError {
+                        errors: results_errors,
+                        stats,
+                    }))
+                } else {
+                    Ok(BucketMigrationStats {
+                        bucket: conf.source_bucket.clone(),
+                        synchronization_time: sync_start.elapsed(),
+                        synchronization_size: total_synced_size,
+                        delete_size: total_deleted_size,
+                        total_files_sync,
+                        total_files_delete,
+                    })
+                }
+            } else {
+                event!(
+                    Level::WARN,
+                    "{} | No files to synchronize",
+                    conf.source_bucket
+                );
                 Ok(BucketMigrationStats {
                     bucket: conf.source_bucket.clone(),
                     synchronization_time: sync_start.elapsed(),
-                    synchronization_size: objects_to_migrate
-                        .iter()
-                        .fold(0, |acc, obj| acc + obj.get_size() as usize),
-                    objects: objects_to_migrate,
-                    objects_to_delete,
+                    synchronization_size: 0,
+                    delete_size: total_deleted_size,
+                    total_files_sync,
+                    total_files_delete,
                 })
             }
         } else {
-            event!(
-                Level::WARN,
-                "{} | No files to synchronize",
-                conf.source_bucket
-            );
             Ok(BucketMigrationStats {
                 bucket: conf.source_bucket.clone(),
                 synchronization_time: sync_start.elapsed(),
-                synchronization_size: 0,
-                objects: objects_to_migrate,
-                objects_to_delete,
+                synchronization_size: total_synced_size,
+                delete_size: total_deleted_size,
+                total_files_sync,
+                total_files_delete,
             })
         }
-    } else {
-        Ok(BucketMigrationStats {
-            bucket: conf.source_bucket.clone(),
-            synchronization_time: sync_start.elapsed(),
-            synchronization_size: 0,
-            objects: objects_to_migrate,
-            objects_to_delete,
-        })
     }
+    .await
 }
 
 #[instrument(skip(destination_access_key, destination_secret_key), level = "debug")]
@@ -252,7 +471,8 @@ pub async fn create_destination_buckets(
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let client = RadosGW::new(
-        destination_endpoint.clone(),
+        Some(destination_endpoint.clone()),
+        None,
         destination_access_key.clone(),
         destination_secret_key.clone(),
         None,
@@ -288,23 +508,32 @@ pub async fn create_destination_buckets(
         if dry_run {
             // To know if the bucket already exists on another add-on, we can try to list its files. If it's not created, we will receive a NoSuchBucket error
             // If it is, we will receive another error
-            let client_dry_run = RadosGW::new(
-                destination_endpoint.clone(),
-                destination_access_key.clone(),
-                destination_secret_key.clone(),
-                Some(destination_bucket.clone()),
+            let client_dry_run = get_provider(
+                &Providers::Cellar,
+                ProviderConf {
+                    endpoint: Some(destination_endpoint.clone()),
+                    region: None,
+                    access_key: destination_access_key.clone(),
+                    secret_key: destination_secret_key.clone(),
+                    bucket: Some(destination_bucket.clone()),
+                },
             );
 
-            match client_dry_run.list_objects(Some(1)).await {
-                Ok(_) => {}
-                Err(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
-                    event!(Level::INFO, "DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
-                }
-                Err(e) => {
-                    bucket_already_created(&destination_bucket);
-                    return Err(anyhow::Error::from(e));
-                }
-            }
+            match client_dry_run.list_objects(Some(1), None).next().await {
+                Some(Ok(_)) | None => {}
+                Some(Err(error)) => match error.downcast::<RusotoError<_>>() {
+                    Ok(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
+                        event!(Level::INFO, "DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
+                    }
+                    Ok(e) => {
+                        bucket_already_created(&destination_bucket);
+                        return Err(anyhow::Error::from(e));
+                    }
+                    Err(downcast) => {
+                        panic!("Failed to downcast error to a RusotoError: {:?}", downcast)
+                    }
+                },
+            };
         } else {
             event!(
                 Level::INFO,
@@ -325,7 +554,7 @@ pub async fn create_destination_buckets(
                     bucket_already_created(&destination_bucket);
                     return Err(anyhow::Error::from(e));
                 }
-            }
+            };
         }
     }
 

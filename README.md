@@ -1,4 +1,4 @@
-# AWS S3 to Cellar migration tool
+# Cellar migration tool
 
 ## What's this?
 

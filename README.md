@@ -75,7 +75,7 @@ For automatic migrations. Recommended for huge buckets.
 
  ![create bucket from addon dashboard](/assets/bucket.png)
 
-ℹ️ Note: This process has been tested with an existing bucket on Clever Cloud. The CLI, theorically, create a bucket when started and connected to a Cellar addon, but it's not stable enought to be guaranteed.
+ℹ️ Note: This process has been tested with an existing bucket on Clever Cloud. The CLI, theorically, create a bucket when started and connected to a Cellar addon, but it's not stable enough to be guaranteed (but will be at some point ✌️).
 
 ### Deploy this repository
 

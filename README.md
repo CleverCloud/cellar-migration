@@ -97,7 +97,7 @@ For automatic migrations. Recommended for huge buckets.
 ```
 CC_CACHE_DEPENDENCIES="true"
 CC_RUST_BIN="http-server"
-CC_WORKER_COMMAND="cargo run --bin cellar-migration --release -- migrate --source-access-key <src_access_key> --source-secret-key <src_secret_key> --source-bucket <src_bucket> --source-endpoint <src_endpoint> --source-provider <src_provider> --source-region <src_region> --destination-access-key <dst_access_key> --destination-secret-key <dst_secret_key> --destination-bucket <dst_bucket> --destination-endpoint cellar-c2.services.clever-cloud.com --threads 16"
+CC_WORKER_COMMAND="cargo run --bin cellar-migration --release -- migrate --source-access-key <src_access_key> --source-secret-key <src_secret_key> --source-bucket <src_bucket> --source-endpoint <src_endpoint> --source-provider <src_provider> --source-region <src_region> --destination-access-key <dst_access_key> --destination-secret-key <dst_secret_key> --destination-bucket <dst_bucket> --destination-endpoint cellar-c2.services.clever-cloud.com --threads [number]"
 CC_WORKER_RESTART_DELAY="60"
 PORT="8080"
 ```
@@ -106,6 +106,7 @@ Don't forget to modifiy the `CC_WORKER_COMMAND` with your own credentials, where
 
 - `source` = **S3** bucket containing the objects you need to sync
 - `destination` = **Cellar** bucket that will receive the objects.
+- `threads`= We recommend a maximum number of threads of 5 times the number of vCPUS of the chosen instance size. So for a 3XL, it could be 80 threads.
 
 This step is when you take the Cellar credentials you saved and insert it in the command options. An example of what `CC_WORKER_COMMAND`  for migrating from AWS to Clever Cloud would look like this:
 

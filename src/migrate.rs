@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, error};
+use std::{cmp::Ordering, error, collections::VecDeque, sync::{Arc, Mutex}};
 
 use bytesize::ByteSize;
 use futures::StreamExt;
@@ -10,7 +10,7 @@ use tokio::task::JoinError;
 use tracing::{event, instrument, Level};
 
 use crate::{
-    provider::{get_provider, ProviderConf, ProviderObject, Providers},
+    provider::{get_provider, ProviderConf, ProviderObject, Providers, Provider},
     radosgw::{
         uploader::{ThreadMigrationResult, Uploader},
         RadosGW,
@@ -74,23 +74,9 @@ async fn migrate_objects(
     conf: BucketMigrationConfiguration,
     src_objects: &[ProviderObject],
     dst_objects: &[ProviderObject],
+    source_clients: Arc<Mutex<VecDeque<Box<dyn Provider>>>>,
+    radosgw_clients: Arc<Mutex<VecDeque<RadosGW>>>,
 ) -> BucketObjectsMigrationResult {
-    let source_provider_conf = ProviderConf::new(
-        conf.source_endpoint,
-        conf.source_region,
-        conf.source_access_key,
-        conf.source_secret_key,
-        Some(conf.source_bucket.clone()),
-    );
-    let source_provider = get_provider(&conf.source_provider, source_provider_conf);
-
-    let radosgw_client = RadosGW::new(
-        Some(conf.destination_endpoint),
-        None,
-        conf.destination_access_key,
-        conf.destination_secret_key,
-        Some(conf.destination_bucket),
-    );
     let objects_to_migrate: Vec<ProviderObject> = src_objects
         .iter()
         .filter_map(|object| {
@@ -129,8 +115,8 @@ async fn migrate_objects(
     if !conf.dry_run {
         if objects_to_sync > 0 {
             let mut uploader = Uploader::new(
-                source_provider,
-                radosgw_client,
+                source_clients,
+                radosgw_clients,
                 objects_to_migrate,
                 objects_to_delete,
                 conf.sync_threads,
@@ -151,6 +137,9 @@ pub async fn migrate_bucket(
     conf: BucketMigrationConfiguration,
 ) -> anyhow::Result<BucketMigrationStats> {
     let sync_start = std::time::Instant::now();
+    // Pool of source and destination clients
+    let mut source_clients: VecDeque<Box<dyn Provider>> = VecDeque::new();
+    let mut destination_clients: VecDeque<RadosGW> = VecDeque::new();
 
     let async_conf = conf.clone();
     let source_provider_conf = ProviderConf::new(
@@ -174,6 +163,32 @@ pub async fn migrate_bucket(
 
     let mut source_objects_stream = source_provider.list_objects(None, None);
     let mut dest_listing = dest_provider.list_objects(None, None);
+
+    let base_source_provider_conf = ProviderConf::new(
+        async_conf.clone().source_endpoint,
+        async_conf.clone().source_region,
+        async_conf.clone().source_access_key,
+        async_conf.clone().source_secret_key,
+        Some(async_conf.clone().source_bucket.clone()),
+    );
+    let base_source_provider = get_provider(&conf.source_provider, base_source_provider_conf);
+
+    let base_radosgw_client = RadosGW::new(
+        Some(async_conf.clone().destination_endpoint),
+        None,
+        async_conf.clone().destination_access_key,
+        async_conf.clone().destination_secret_key,
+        Some(async_conf.clone().destination_bucket),
+    );
+
+    // Create as much destination clients as we have threads
+    for _ in 0..async_conf.sync_threads {
+        source_clients.push_back(base_source_provider.clone());
+        destination_clients.push_back(base_radosgw_client.clone());
+    }
+
+    let source_clients = Arc::new(Mutex::new(source_clients));
+    let destination_clients = Arc::new(Mutex::new(destination_clients));
 
     // Instead of listing all the files from each side and diff, fetch from both sides some files.
     // From each fetch, check that the last source file is lesser than our last destination file
@@ -284,7 +299,7 @@ pub async fn migrate_bucket(
                 event!(Level::DEBUG, "Destination objects: {}", dst_objects.len());
 
                 let migration_result =
-                    migrate_objects(async_conf.clone(), &src_objects, &dst_objects).await;
+                    migrate_objects(async_conf.clone(), &src_objects, &dst_objects, source_clients.clone(), destination_clients.clone()).await;
 
                 match migration_result {
                     BucketObjectsMigrationResult::DryRun(to_migrate, to_delete) => {

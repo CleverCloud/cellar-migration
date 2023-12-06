@@ -28,8 +28,8 @@ pub struct ThreadMigrationResult {
 
 #[derive(Debug, Clone)]
 pub struct Uploader {
-    source_provider_client: Box<dyn Provider>,
-    radosgw_client: RadosGW,
+    source_provider_clients: Arc<Mutex<VecDeque<Box<dyn Provider>>>>,
+    radosgw_clients: Arc<Mutex<VecDeque<RadosGW>>>,
     objects: Arc<Mutex<VecDeque<ProviderObject>>>,
     objects_to_delete: Arc<Mutex<VecDeque<ProviderObject>>>,
     threads: usize,
@@ -38,8 +38,8 @@ pub struct Uploader {
 
 impl Uploader {
     pub fn new(
-        source_provider_client: Box<dyn Provider>,
-        radosgw_client: RadosGW,
+        source_provider_clients: Arc<Mutex<VecDeque<Box<dyn Provider>>>>,
+        radosgw_clients: Arc<Mutex<VecDeque<RadosGW>>>,
         objects: Vec<ProviderObject>,
         objects_to_delete: Vec<ProviderObject>,
         threads: usize,
@@ -55,8 +55,8 @@ impl Uploader {
         }
 
         Uploader {
-            source_provider_client,
-            radosgw_client,
+            source_provider_clients,
+            radosgw_clients,
             objects: Arc::new(Mutex::new(VecDeque::from(objects))),
             objects_to_delete: Arc::new(Mutex::new(VecDeque::from(objects_to_delete))),
             threads: std::cmp::min(threads, sync_len),
@@ -71,8 +71,8 @@ impl Uploader {
         let total_files_to_delete = self.objects_to_delete.clone().lock().unwrap().len();
 
         for thread_id in 0..self.threads {
-            let riak_client = self.source_provider_client.clone();
-            let radosgw_client = self.radosgw_client.clone();
+            let source_clients = self.source_provider_clients.clone();
+            let radosgw_clients = self.radosgw_clients.clone();
             let files = self.objects.clone();
             let files_to_delete = self.objects_to_delete.clone();
             let multipart_chunk_size = self.multipart_chunk_size;
@@ -87,6 +87,12 @@ impl Uploader {
                         (object, remaining)
                     };
 
+                    let radosgw_client = radosgw_clients
+                        .lock()
+                        .expect("Tried to lock radosgw_clients mutex but failed")
+                        .pop_front()
+                        .expect("We should have a RadosGW client available");
+
                     if let Some(object) = object {
                         event!(
                             Level::INFO,
@@ -97,8 +103,14 @@ impl Uploader {
                             object.get_key()
                         );
 
+                        let source_client = source_clients
+                            .lock()
+                            .expect("Tried to lock source_clients mutex but failed")
+                            .pop_front()
+                            .expect("We should have a source client available");
+
                         let result = Uploader::sync_object(
-                            &*riak_client,
+                            &*source_client,
                             &radosgw_client,
                             &object,
                             thread_id,
@@ -108,6 +120,14 @@ impl Uploader {
                         .map(|_| object.get_size() as usize);
 
                         results.push(result);
+                        source_clients
+                            .lock()
+                            .expect("Tried to lock source_clients mutex but failed")
+                            .push_back(source_client);
+                        radosgw_clients
+                            .lock()
+                            .expect("Tried to lock radosgw_clients mutex but failed")
+                            .push_back(radosgw_client);
                     } else {
                         let (object_to_delete, remaining) = {
                             let mut files = files_to_delete.lock().unwrap();
@@ -134,6 +154,10 @@ impl Uploader {
                             .await
                             .map(|object| object.get_size() as usize);
 
+                            radosgw_clients
+                                .lock()
+                                .expect("Tried to lock radosgw_clients mutex but failed")
+                                .push_back(radosgw_client);
                             delete_results.push(result);
                         } else {
                             event!(
@@ -141,6 +165,11 @@ impl Uploader {
                                 "Thread {} | No more objects to synchronize, quitting..",
                                 thread_id
                             );
+                            radosgw_clients
+                                .lock()
+                                .expect("Tried to lock radosgw_clients mutex but failed")
+                                .push_back(radosgw_client);
+
                             break;
                         }
                     }

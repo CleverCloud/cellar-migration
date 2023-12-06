@@ -21,7 +21,7 @@ use rusoto_s3::{
     HeadObjectOutput, HeadObjectRequest, ListObjectsV2Request, PutObjectError, PutObjectOutput,
     PutObjectRequest, S3Client, UploadPartError, UploadPartOutput, UploadPartRequest, S3,
 };
-use tracing::{event, instrument, Level};
+use tracing::{event, instrument, Level, error};
 
 use crate::provider::{
     Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse, ProviderResponseStreamChunk,
@@ -435,7 +435,11 @@ impl ProviderResponse for RadosGWResponse {
             Some(err) => match err.downcast_ref::<GetObjectError>() {
                 Some(GetObjectError::NoSuchKey(_)) => 404,
                 Some(GetObjectError::InvalidObjectState(_)) => 500,
-                None => unreachable!("Failed to downcast to a GetObjetError: {:?}", err),
+                None => {
+                    // Usually, network errors or stuff like that
+                    error!("Failed to downcast to a GetObjetError: {:?}", err);
+                    500
+                }
             },
         }
     }

@@ -4,14 +4,14 @@ pub mod uploader;
 use std::{
     pin::Pin,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex}, fmt::Debug,
 };
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use rusoto_core::{ByteStream, RusotoError};
+use rusoto_core::{ByteStream, RusotoError, HttpConfig};
 use rusoto_s3::{
     AbortMultipartUploadError, AbortMultipartUploadOutput, AbortMultipartUploadRequest, Bucket,
     CompleteMultipartUploadError, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
@@ -21,7 +21,7 @@ use rusoto_s3::{
     HeadObjectOutput, HeadObjectRequest, ListObjectsV2Request, PutObjectError, PutObjectOutput,
     PutObjectRequest, S3Client, UploadPartError, UploadPartOutput, UploadPartRequest, S3,
 };
-use tracing::{event, instrument, Level};
+use tracing::{event, instrument, Level, error};
 
 use crate::provider::{
     Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse, ProviderResponseStreamChunk,
@@ -30,13 +30,19 @@ use crate::provider::{
 const MAX_FETCH_KEYS: usize = 1000;
 const REQUESTS_MAX_RETRIES: usize = 5;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RadosGW {
-    endpoint: Option<String>,
-    region: Option<String>,
-    access_key: String,
-    secret_key: String,
     bucket: Option<String>,
+    client: S3Client,
+}
+
+impl Debug for RadosGW {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RadosGW")
+            .field("bucket", &self.bucket)
+            .field("client", &"S3Client")
+            .finish()
+    }
 }
 
 impl RadosGW {
@@ -48,22 +54,23 @@ impl RadosGW {
         bucket: Option<String>,
     ) -> RadosGW {
         RadosGW {
-            endpoint,
-            region,
-            access_key,
-            secret_key,
             bucket,
+            client: RadosGW::get_client(access_key, secret_key, endpoint, region)
         }
     }
 
-    #[instrument(skip(self), level = "trace")]
-    fn get_client(&self) -> S3Client {
+    #[instrument(level = "trace")]
+    fn get_client(access_key: String, secret_key: String, endpoint: Option<String>, region: Option<String>) -> S3Client {
         let radosgw_credential_provider = awscredentials::AWSCredentialsProvider::new(
-            self.access_key.clone(),
-            self.secret_key.clone(),
+            access_key,
+            secret_key
         );
-        let http_client = rusoto_core::HttpClient::new().unwrap();
-        let region = match (&self.endpoint, &self.region) {
+
+        let mut http_config = HttpConfig::new();
+        http_config.pool_idle_timeout(std::time::Duration::from_secs(10));
+        let http_client = rusoto_core::HttpClient::new_with_config(http_config).unwrap();
+
+        let region = match (&endpoint, &region) {
             // Can happen for other S3 like services
             (Some(endpoint), Some(region)) => rusoto_core::Region::Custom {
                 name: region.clone(),
@@ -115,8 +122,7 @@ impl RadosGW {
             ..Default::default()
         };
 
-        let client = self.get_client();
-        client.put_object(put_object_request).await
+        self.client.put_object(put_object_request).await
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -146,8 +152,7 @@ impl RadosGW {
             ..Default::default()
         };
 
-        let client = self.get_client();
-        client
+        self.client
             .create_multipart_upload(multipart_upload_request)
             .await
     }
@@ -174,8 +179,7 @@ impl RadosGW {
             ..Default::default()
         };
 
-        let client = self.get_client();
-        client.upload_part(part_upload_request).await
+        self.client.upload_part(part_upload_request).await
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -208,8 +212,7 @@ impl RadosGW {
             ..Default::default()
         };
 
-        let client = self.get_client();
-        client
+        self.client
             .complete_multipart_upload(complete_multipart_upload_request)
             .await
     }
@@ -230,8 +233,7 @@ impl RadosGW {
             ..Default::default()
         };
 
-        let client = self.get_client();
-        client
+        self.client
             .abort_multipart_upload(abort_multipart_upload_request)
             .await
     }
@@ -261,13 +263,12 @@ impl RadosGW {
                 ..Default::default()
             };
 
-            let client = self.get_client();
             event!(
                 Level::TRACE,
                 "Sending ListObjectV2Request: {:x?}",
                 list_objects_request
             );
-            let objects = client
+            let objects = self.client
                 .list_objects_v2(list_objects_request.clone())
                 .await
                 .map(|res| res.contents.unwrap_or_default());
@@ -302,7 +303,6 @@ impl RadosGW {
         &self,
         object: ProviderObject,
     ) -> Result<ProviderObject, RusotoError<DeleteObjectError>> {
-        let client = self.get_client();
         let delete_object_request = DeleteObjectRequest {
             bucket: self
                 .bucket
@@ -312,7 +312,7 @@ impl RadosGW {
             ..Default::default()
         };
 
-        client
+        self.client
             .delete_object(delete_object_request)
             .await
             .map(|_| object)
@@ -320,8 +320,7 @@ impl RadosGW {
 
     #[instrument(skip(self), level = "debug")]
     pub async fn list_buckets(&self) -> anyhow::Result<Vec<Bucket>> {
-        let client = self.get_client();
-        client
+        self.client
             .list_buckets()
             .await
             .map_err(anyhow::Error::from)
@@ -333,7 +332,6 @@ impl RadosGW {
         &self,
         bucket: String,
     ) -> Result<(), RusotoError<CreateBucketError>> {
-        let client = self.get_client();
         // TODO: check if original bucket is public and if it is, apply the same ACL here
         // There might also be some policies, we need to create them.
         let create_bucket_request = CreateBucketRequest {
@@ -341,7 +339,7 @@ impl RadosGW {
             ..Default::default()
         };
 
-        client
+        self.client
             .create_bucket(create_bucket_request)
             .await
             .map(|_| ())
@@ -351,8 +349,6 @@ impl RadosGW {
         &self,
         object: &ProviderObject,
     ) -> anyhow::Result<HeadObjectOutput> {
-        let client = self.get_client();
-
         let head_object_request = HeadObjectRequest {
             bucket: self
                 .bucket
@@ -362,7 +358,7 @@ impl RadosGW {
             ..Default::default()
         };
 
-        client
+        self.client
             .head_object(head_object_request)
             .await
             .map_err(|error| {
@@ -376,8 +372,6 @@ impl RadosGW {
 
     #[instrument(skip(self), level = "debug")]
     pub async fn get_object(&self, object: &ProviderObject) -> anyhow::Result<GetObjectOutput> {
-        let client = self.get_client();
-
         let get_object_request = GetObjectRequest {
             bucket: self
                 .bucket
@@ -387,7 +381,7 @@ impl RadosGW {
             ..Default::default()
         };
 
-        client
+        self.client
             .get_object(get_object_request)
             .await
             .map_err(|error| anyhow!("Error fetching object {}: {:?}", object.get_key(), error))
@@ -441,7 +435,11 @@ impl ProviderResponse for RadosGWResponse {
             Some(err) => match err.downcast_ref::<GetObjectError>() {
                 Some(GetObjectError::NoSuchKey(_)) => 404,
                 Some(GetObjectError::InvalidObjectState(_)) => 500,
-                None => unreachable!("Failed to downcast to a GetObjetError"),
+                None => {
+                    // Usually, network errors or stuff like that
+                    error!("Failed to downcast to a GetObjetError: {:?}", err);
+                    500
+                }
             },
         }
     }

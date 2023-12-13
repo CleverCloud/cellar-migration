@@ -420,7 +420,7 @@ pub async fn migrate_bucket(
                     })
                     .collect::<Vec<String>>();
 
-                let results_errors = vec![&sync_errors[..], &delete_errors[..]].concat();
+                let results_errors = [&sync_errors[..], &delete_errors[..]].concat();
 
                 if !results_errors.is_empty() {
                     let stats = BucketMigrationStats {

@@ -227,7 +227,7 @@ impl RiakCS {
                 marker
                     .take()
                     .map(|m| format!("&marker={}", urlencoding::encode(&m)))
-                    .unwrap_or_else(String::new)
+                    .unwrap_or_default()
             );
 
             event!(Level::TRACE, "Build request with uri: {}", uri);

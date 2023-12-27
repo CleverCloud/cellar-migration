@@ -40,3 +40,4 @@ clap = { version = "4.1", features = ["cargo", "suggestions"] }
 num_cpus = "1.13"
 bytesize = "1.1"
 dyn-clone = "1.0.10"
+libc = "0.2"

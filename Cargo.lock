@@ -203,6 +203,7 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-tls",
+ "libc",
  "num_cpus",
  "ring",
  "rusoto_core",

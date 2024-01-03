@@ -2,17 +2,17 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     pin::Pin,
-    str::FromStr,
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Utc};
 use dyn_clone::DynClone;
 use futures::{Stream, StreamExt};
 use tracing::{event, instrument, Level};
+use aws_smithy_types_convert::date_time::DateTimeExt;
 
 use crate::{
     radosgw::RadosGW,
@@ -85,14 +85,13 @@ impl From<&ObjectContents> for ProviderObject {
     }
 }
 
-impl From<&rusoto_s3::Object> for ProviderObject {
-    fn from(value: &rusoto_s3::Object) -> Self {
+impl From<&aws_sdk_s3::types::Object> for ProviderObject {
+    fn from(value: &aws_sdk_s3::types::Object) -> Self {
         ProviderObject {
             key: value.key.clone().expect("Object key shouldn't be null"),
             last_modified: value
                 .last_modified
-                .clone()
-                .map(|e| DateTime::from_str(&e).expect("Object last_modified should be a date"))
+                .map(|e| e.to_chrono_utc().unwrap_or_else(|_| panic!("Should be able to transform AWS datetime {:?} to chrono datetime", e)))
                 .expect("Object last_modified shouldn't be null"),
             etag: value.e_tag.clone().expect("Object ETag shouldn't be null"),
             size: value.size.expect("Object size shouldn't be null") as u64,
@@ -126,7 +125,7 @@ impl PartialEq<ProviderObject> for ProviderObject {
 #[derive(Debug)]
 pub struct ProviderObjectMetadata {
     pub acl_public: bool,
-    pub last_modified: Option<DateTime<FixedOffset>>,
+    pub last_modified: Option<DateTime<Utc>>,
     pub etag: Option<String>,
     pub content_type: Option<String>,
     pub content_length: usize,
@@ -135,7 +134,7 @@ pub struct ProviderObjectMetadata {
     pub content_encoding: Option<String>,
     pub content_language: Option<String>,
     pub content_md5: Option<String>,
-    pub expires: Option<String>,
+    pub expires: Option<DateTime<Utc>>,
 }
 
 impl From<ObjectMetadataResponse> for ProviderObjectMetadata {
@@ -157,15 +156,11 @@ impl From<ObjectMetadataResponse> for ProviderObjectMetadata {
     }
 }
 
-impl From<rusoto_s3::HeadObjectOutput> for ProviderObjectMetadata {
-    fn from(value: rusoto_s3::HeadObjectOutput) -> Self {
+impl From<aws_sdk_s3::operation::head_object::HeadObjectOutput> for ProviderObjectMetadata {
+    fn from(value: aws_sdk_s3::operation::head_object::HeadObjectOutput) -> Self {
         ProviderObjectMetadata {
             acl_public: false,
-            last_modified: value.last_modified.map(|d| {
-                DateTime::parse_from_rfc2822(&d).unwrap_or_else(|_| {
-                    panic!("Object should have a valid last modified date: {}", d)
-                })
-            }),
+            last_modified: value.last_modified.map(|date| date.to_chrono_utc().unwrap_or_else(|_| panic!("Should be able to transfom AWS datetime {:?} to chrono datetime", date))),
             etag: value.e_tag,
             content_type: value.content_type,
             content_length: value
@@ -176,13 +171,15 @@ impl From<rusoto_s3::HeadObjectOutput> for ProviderObjectMetadata {
             content_encoding: value.content_encoding,
             content_language: value.content_language,
             content_md5: None,
-            expires: value.expires,
+            expires: value.expires.map(|date| date.to_chrono_utc().unwrap_or_else(|_| panic!("Should be able to transform AWS datetime {:?} to chrono datetime", date))),
         }
     }
 }
 
-type ProviderResponseStreamInner =
-    Arc<Mutex<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>>>;
+pub(crate) type ProviderResponseStream =
+    Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + Sync>>;
+pub (crate) type ProviderResponseStreamInner =
+    Arc<Mutex<ProviderResponseStream>>;
 
 /// This struct exists so we can share a single RiakResponseStreamChunk
 /// that will be fed to multiple ByteStream instances, without losing the
@@ -205,13 +202,44 @@ impl Stream for ProviderResponseStreamChunkWrapper {
     }
 }
 
+pub(crate) struct ProviderResponseHttp04X {
+    stream: ProviderResponseStream,
+}
+
+impl ProviderResponseHttp04X {
+    pub fn new(stream: ProviderResponseStream) -> Self {
+        Self {
+            stream,
+        }
+    }
+}
+
+impl http_body::Body for ProviderResponseHttp04X {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_data(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+            self.stream.poll_next_unpin(cx)
+    }
+
+    fn poll_trailers(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<Option<hyper::HeaderMap>, Self::Error>> {
+        unimplemented!("ProviderResponseHttp04X::poll_trailers unimplemented")
+    }
+}
+
 pub trait ProviderResponse: Debug + Send + Sync {
     fn status(&self) -> u16;
-    fn body(&mut self) -> Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
+    fn body(&mut self) -> ProviderResponseStream;
     fn body_chunked(
         &mut self,
         chunk_size: usize,
-    ) -> Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
+    ) -> ProviderResponseStream;
 }
 
 impl dyn ProviderResponse {
@@ -313,7 +341,7 @@ pub enum ProviderResponseStreamChunkState {
 /// This structure simulates that, encapsulates the RiakResponseStream and keep an internal state on when to end the stream
 /// because a part has been fully read.
 pub struct ProviderResponseStreamChunk {
-    response: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    response: ProviderResponseStream,
     chunk_size: usize,
     chunks: VecDeque<Bytes>,
     returned_bytes: usize,
@@ -322,7 +350,7 @@ pub struct ProviderResponseStreamChunk {
 
 impl ProviderResponseStreamChunk {
     pub fn new(
-        response: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        response: ProviderResponseStream,
         chunk_size: usize,
     ) -> ProviderResponseStreamChunk {
         ProviderResponseStreamChunk {

@@ -17,10 +17,14 @@ path = "src/http-server.rs"
 
 [dependencies]
 async-trait = "0.1.51"
-rusoto_core = "0.48.0"
-rusoto_s3 = "0.48.0"
-rusoto_credential = "0.48.0"
+aws-config = { version = "1.1.1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.11.0"
+aws-smithy-runtime-api = "1.1.1"
+aws-smithy-types = { version = "1.1.1", features = ["http-body-0-4-x", "byte-stream-poll-next"] }
+aws-smithy-types-convert = { version = "0.60.1", features = ["convert-chrono"] }
+aws-credential-types = { version = "1.1.1", features = ["hardcoded-credentials"] }
 tokio = { version = "1", features = ["full"] }
+http-body = "0.4"
 hyper = { version = "0.14.15", features = ["client", "stream", "server"] }
 hyper-tls = { version = "0.5.0", features = ["vendored"] }
 base64 = "0.21.0"
@@ -41,3 +45,4 @@ num_cpus = "1.13"
 bytesize = "1.1"
 dyn-clone = "1.0.10"
 libc = "0.2"
+url = "2.5"

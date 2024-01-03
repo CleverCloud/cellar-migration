@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Utc, TimeZone};
 use hyper::{Body, Response};
 
 use serde_derive::Deserialize;
@@ -78,7 +78,7 @@ impl ObjectMetadataResponse {
 
 #[derive(Debug, Clone)]
 pub struct ObjectMetadata {
-    pub last_modified: Option<DateTime<FixedOffset>>,
+    pub last_modified: Option<DateTime<Utc>>,
     pub etag: Option<String>,
     pub content_type: Option<String>,
     pub content_length: usize,
@@ -87,7 +87,7 @@ pub struct ObjectMetadata {
     pub content_encoding: Option<String>,
     pub content_language: Option<String>,
     pub content_md5: Option<String>,
-    pub expires: Option<String>,
+    pub expires: Option<DateTime<Utc>>,
 }
 
 impl ObjectMetadata {
@@ -104,11 +104,11 @@ impl From<Response<Body>> for ObjectMetadata {
     fn from(response: Response<Body>) -> Self {
         ObjectMetadata {
             last_modified: response.headers().get("last-modified").map(|lm| {
-                DateTime::parse_from_rfc2822(
+                let date = DateTime::parse_from_rfc2822(
                     lm.to_str()
                         .expect("Last Modified header should be a valid string"),
-                )
-                .expect("Last Modified header should be a valid UTC date")
+                ).expect("Last Modified header should be a valid UTC date");
+                Utc.from_utc_datetime(&date.naive_utc())
             }),
             etag: Self::extract_header(&response, "etag").map(|etag| etag.replace('\"', "")),
             content_type: Self::extract_header(&response, "content-type"),
@@ -123,7 +123,11 @@ impl From<Response<Body>> for ObjectMetadata {
             content_encoding: Self::extract_header(&response, "content-encoding"),
             content_language: Self::extract_header(&response, "content-language"),
             content_md5: Self::extract_header(&response, "content-md5"),
-            expires: Self::extract_header(&response, "expires"),
+            expires: Self::extract_header(&response, "expires").map(|lm| {
+                let date = DateTime::parse_from_rfc2822(&lm)
+                    .expect("Last Modified header should be a valid UTC date");
+                Utc.from_utc_datetime(&date.naive_utc())
+            }),
         }
     }
 }

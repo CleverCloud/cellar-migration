@@ -1,31 +1,26 @@
-pub mod awscredentials;
 pub mod uploader;
 
 use std::{
     pin::Pin,
-    str::FromStr,
-    sync::{Arc, Mutex}, fmt::Debug,
+    fmt::Debug,
 };
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use aws_config::{SdkConfig, timeout::TimeoutConfig, retry::{RetryConfigBuilder, RetryMode}, BehaviorVersion, Region};
+use aws_credential_types::Credentials;
+use aws_sdk_s3::{primitives::ByteStream, operation::{put_object::{PutObjectOutput, PutObjectError}, create_multipart_upload::{CreateMultipartUploadOutput, CreateMultipartUploadError}, upload_part::{UploadPartOutput, UploadPartError}, complete_multipart_upload::{CompleteMultipartUploadOutput, CompleteMultipartUploadError}, abort_multipart_upload::{AbortMultipartUploadOutput, AbortMultipartUploadError}, delete_object::DeleteObjectError, create_bucket::CreateBucketError, head_object::HeadObjectOutput, get_object::{GetObjectOutput, GetObjectError}}, error::SdkError, types::{CompletedMultipartUpload, CompletedPart, Bucket}};
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_types_convert::date_time::DateTimeExt;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
-use rusoto_core::{ByteStream, RusotoError, HttpConfig};
-use rusoto_s3::{
-    AbortMultipartUploadError, AbortMultipartUploadOutput, AbortMultipartUploadRequest, Bucket,
-    CompleteMultipartUploadError, CompleteMultipartUploadOutput, CompleteMultipartUploadRequest,
-    CompletedMultipartUpload, CompletedPart, CreateBucketError, CreateBucketRequest,
-    CreateMultipartUploadError, CreateMultipartUploadOutput, CreateMultipartUploadRequest,
-    DeleteObjectError, DeleteObjectRequest, GetObjectError, GetObjectOutput, GetObjectRequest,
-    HeadObjectOutput, HeadObjectRequest, ListObjectsV2Request, PutObjectError, PutObjectOutput,
-    PutObjectRequest, S3Client, UploadPartError, UploadPartOutput, UploadPartRequest, S3,
-};
-use tracing::{event, instrument, Level, error};
+use futures::Stream;
+use tracing::{event, instrument, Level, error, debug};
 
 use crate::provider::{
-    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse, ProviderResponseStreamChunk,
+    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse, ProviderResponseStreamChunk, ProviderResponseStream,
 };
+
+type S3Client = aws_sdk_s3::Client;
 
 const MAX_FETCH_KEYS: usize = 1000;
 const REQUESTS_MAX_RETRIES: usize = 5;
@@ -61,34 +56,50 @@ impl RadosGW {
 
     #[instrument(level = "trace")]
     fn get_client(access_key: String, secret_key: String, endpoint: Option<String>, region: Option<String>) -> S3Client {
-        let radosgw_credential_provider = awscredentials::AWSCredentialsProvider::new(
-            access_key,
-            secret_key
-        );
+        let creds = Credentials::from_keys(access_key, secret_key, None);
+        let timeout_config = TimeoutConfig::builder()
+            .operation_timeout(std::time::Duration::from_secs(30))
+            .operation_attempt_timeout(std::time::Duration::from_secs(600)) // It might take some time for huge upload parts
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .build();
+        let retry_config = RetryConfigBuilder::new()
+            .mode(RetryMode::Standard)
+            .max_attempts(REQUESTS_MAX_RETRIES as _)
+            .build();
+        let mut sdk_config = SdkConfig::builder()
+            .retry_config(retry_config)
+            .timeout_config(timeout_config);
+        //http_config.pool_idle_timeout(std::time::Duration::from_secs(10));
+        //let http_client = rusoto_core::HttpClient::new_with_config(http_config).unwrap();
 
-        let mut http_config = HttpConfig::new();
-        http_config.pool_idle_timeout(std::time::Duration::from_secs(10));
-        let http_client = rusoto_core::HttpClient::new_with_config(http_config).unwrap();
-
-        let region = match (&endpoint, &region) {
+        match (&endpoint, &region) {
             // Can happen for other S3 like services
-            (Some(endpoint), Some(region)) => rusoto_core::Region::Custom {
-                name: region.clone(),
-                endpoint: endpoint.clone(),
+            (Some(endpoint), Some(region)) => {
+                let region = aws_sdk_s3::config::Region::new(region.clone());
+                sdk_config
+                    .set_region(region)
+                    .set_endpoint_url(Some(endpoint.clone()));
             },
-            (Some(endpoint), None) => rusoto_core::Region::Custom {
-                name: "default".to_string(),
-                endpoint: endpoint.clone(),
+            (Some(endpoint), None) => {
+                sdk_config.set_endpoint_url(Some(endpoint.clone()));
+                sdk_config.set_region(Some(Region::from_static("eu-west-1")));
             },
             (None, Some(region)) => {
-                rusoto_core::Region::from_str(region).expect("Region should be valid")
+                let region = aws_sdk_s3::config::Region::new(region.clone());
+                sdk_config.set_region(region);
             }
             _ => unreachable!(),
         };
 
         event!(Level::DEBUG, "Using client with region: {:?}", region);
 
-        S3Client::new_with(http_client, radosgw_credential_provider, region)
+        let sdk_config = sdk_config.build();
+        debug!("sdk_config: {:?}", sdk_config);
+        let config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .credentials_provider(creds)
+            .behavior_version(BehaviorVersion::v2023_11_09())
+            .build();
+        S3Client::from_conf(config)
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -98,31 +109,22 @@ impl RadosGW {
         object_metadata: &ProviderObjectMetadata,
         size: i64,
         body: ByteStream,
-    ) -> Result<PutObjectOutput, RusotoError<PutObjectError>> {
-        let put_object_request = PutObjectRequest {
-            body: Some(body),
-            key,
-            bucket: self
-                .bucket
-                .clone()
-                .expect("put_object should have a bucket"),
-            content_length: Some(size),
-            acl: if object_metadata.acl_public {
-                Some("public-read".to_string())
-            } else {
-                None
-            },
-            cache_control: object_metadata.cache_control.clone(),
-            content_disposition: object_metadata.content_disposition.clone(),
-            content_encoding: object_metadata.content_encoding.clone(),
-            content_language: object_metadata.content_language.clone(),
-            content_md5: object_metadata.content_md5.clone(),
-            content_type: object_metadata.content_type.clone(),
-            expires: object_metadata.expires.clone(),
-            ..Default::default()
-        };
-
-        self.client.put_object(put_object_request).await
+    ) -> Result<PutObjectOutput, SdkError<PutObjectError, HttpResponse>> {
+        self.client.put_object()
+            .body(body)
+            .key(key)
+            .bucket(self.bucket.clone().expect("put_object should have a bucket"))
+            .content_length(size)
+            .set_acl(if object_metadata.acl_public { Some(aws_sdk_s3::types::ObjectCannedAcl::PublicRead) } else { None })
+            .set_cache_control(object_metadata.cache_control.clone())
+            .set_content_disposition(object_metadata.content_disposition.clone())
+            .set_content_encoding(object_metadata.content_encoding.clone())
+            .set_content_language(object_metadata.content_language.clone())
+            .set_content_md5(object_metadata.content_md5.clone())
+            .set_content_type(object_metadata.content_type.clone())
+            .set_expires(object_metadata.expires.map(aws_smithy_types::date_time::DateTime::from_chrono_utc))
+            .send()
+            .await
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -130,31 +132,21 @@ impl RadosGW {
         &self,
         key: String,
         object_metadata: &ProviderObjectMetadata,
-    ) -> Result<CreateMultipartUploadOutput, RusotoError<CreateMultipartUploadError>> {
-        let multipart_upload_request = CreateMultipartUploadRequest {
-            key,
-            bucket: self
-                .bucket
-                .clone()
-                .expect("create_multipart_upload should have a bucket"),
-            acl: if object_metadata.acl_public {
-                Some("public-read".to_string())
-            } else {
-                None
-            },
-            // We don't have the content_md5 in this list but I don't think we really care
-            cache_control: object_metadata.cache_control.clone(),
-            content_disposition: object_metadata.content_disposition.clone(),
-            content_encoding: object_metadata.content_encoding.clone(),
-            content_language: object_metadata.content_language.clone(),
-            content_type: object_metadata.content_type.clone(),
-            expires: object_metadata.expires.clone(),
-            ..Default::default()
-        };
-
+    ) -> Result<CreateMultipartUploadOutput, SdkError<CreateMultipartUploadError, HttpResponse>> {
         self.client
-            .create_multipart_upload(multipart_upload_request)
+            .create_multipart_upload()
+            .key(key)
+            .bucket(self.bucket.clone().expect("create_multipart_upload should have a bucket"))
+            .set_acl(if object_metadata.acl_public { Some(aws_sdk_s3::types::ObjectCannedAcl::PublicRead) } else { None })
+            .set_cache_control(object_metadata.cache_control.clone())
+            .set_content_disposition(object_metadata.content_disposition.clone())
+            .set_content_encoding(object_metadata.content_encoding.clone())
+            .set_content_language(object_metadata.content_language.clone())
+            .set_content_type(object_metadata.content_type.clone())
+            .set_expires(object_metadata.expires.map(aws_smithy_types::date_time::DateTime::from_chrono_utc))
+            .send()
             .await
+
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -164,22 +156,17 @@ impl RadosGW {
         size: i64,
         body: ByteStream,
         upload_id: String,
-        part_number: i64,
-    ) -> Result<UploadPartOutput, RusotoError<UploadPartError>> {
-        let part_upload_request = UploadPartRequest {
-            key,
-            bucket: self
-                .bucket
-                .clone()
-                .expect("put_object_part should have a bucket"),
-            body: Some(body),
-            upload_id,
-            part_number,
-            content_length: Some(size),
-            ..Default::default()
-        };
-
-        self.client.upload_part(part_upload_request).await
+        part_number: i32,
+    ) -> Result<UploadPartOutput, SdkError<UploadPartError, HttpResponse>> {
+        self.client.upload_part()
+        .key(key)
+        .bucket(self.bucket.clone().expect("put_object_part should have a bucket"))
+        .body(body)
+        .upload_id(upload_id)
+        .part_number(part_number)
+        .content_length(size)
+        .send()
+        .await
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -188,32 +175,28 @@ impl RadosGW {
         key: String,
         upload_id: String,
         parts: Vec<(usize, UploadPartOutput)>,
-    ) -> Result<CompleteMultipartUploadOutput, RusotoError<CompleteMultipartUploadError>> {
-        let completed_multipart_upload_parts = CompletedMultipartUpload {
-            parts: Some(
-                parts
-                    .iter()
-                    .map(|(part_number, part)| CompletedPart {
-                        e_tag: part.e_tag.clone(),
-                        part_number: Some(*part_number as i64),
-                    })
-                    .collect(),
-            ),
-        };
+    ) -> Result<CompleteMultipartUploadOutput, SdkError<CompleteMultipartUploadError, HttpResponse>> {
+        let parts = parts
+            .iter()
+            .map(|(part_number, part)| {
+                CompletedPart::builder()
+                    .set_e_tag(part.e_tag.clone())
+                    .part_number(*part_number as _)
+                    .build()
+            })
+            .collect();
 
-        let complete_multipart_upload_request = CompleteMultipartUploadRequest {
-            key,
-            bucket: self
-                .bucket
-                .clone()
-                .expect("complete_multipart_upload should have a bucket"),
-            multipart_upload: Some(completed_multipart_upload_parts),
-            upload_id,
-            ..Default::default()
-        };
+        let completed_multipart_upload_parts = CompletedMultipartUpload::builder()
+            .set_parts(Some(parts))
+            .build();
 
         self.client
-            .complete_multipart_upload(complete_multipart_upload_request)
+            .complete_multipart_upload()
+            .key(key)
+            .bucket(self.bucket.clone().expect("complete_multipart_upload should have a bucket"))
+            .multipart_upload(completed_multipart_upload_parts)
+            .upload_id(upload_id)
+            .send()
             .await
     }
 
@@ -222,98 +205,60 @@ impl RadosGW {
         &self,
         key: String,
         upload_id: String,
-    ) -> Result<AbortMultipartUploadOutput, RusotoError<AbortMultipartUploadError>> {
-        let abort_multipart_upload_request = AbortMultipartUploadRequest {
-            key,
-            bucket: self
-                .bucket
-                .clone()
-                .expect("abort_multipart_upload should have a bucket"),
-            upload_id,
-            ..Default::default()
-        };
-
+    ) -> Result<AbortMultipartUploadOutput, SdkError<AbortMultipartUploadError, HttpResponse>> {
         self.client
-            .abort_multipart_upload(abort_multipart_upload_request)
+            .abort_multipart_upload()
+            .key(key)
+            .bucket(self.bucket.clone().expect("abort_multipart_upload should have a bucket"))
+            .upload_id(upload_id)
+            .send()
             .await
     }
 
     #[instrument(skip(self), level = "trace")]
     async fn list_objects(
         &self,
-        max_results: Option<i64>,
+        max_results: Option<i32>,
         start_after: Option<String>,
-    ) -> anyhow::Result<Vec<rusoto_s3::Object>> {
-        // Keep track of retries
-        let mut retries = 0;
+    ) -> anyhow::Result<Vec<aws_sdk_s3::types::Object>> {
+        event!(
+            Level::TRACE,
+            "Sending ListObjectV2Request: bucket={:?}, start_after={:?}, max_keys={:?}",
+            self.bucket, start_after, max_results
+        );
 
-        loop {
-            if retries > REQUESTS_MAX_RETRIES {
-                event!(Level::ERROR, "We've hit max retries when listing objects. Check warning logs for more details");
-                return Err(anyhow::anyhow!("MaxRetriesHit when listing objects"));
-            }
+        let objects = self.client
+            .list_objects_v2()
+            .bucket(self.bucket.clone().expect("list_objects should have a bucket"))
+            .set_start_after(start_after.clone())
+            .set_max_keys(max_results)
+            .send()
+            .await
+            .map(|res| res.contents.unwrap_or_default());
 
-            let list_objects_request = ListObjectsV2Request {
-                bucket: self
-                    .bucket
-                    .clone()
-                    .expect("list_objects should have a bucket"),
-                start_after: start_after.clone(),
-                max_keys: max_results,
-                ..Default::default()
-            };
+        event!(
+            Level::TRACE,
+            "Got ListObjectV2Request result result: {:?}",
+            objects
+        );
 
-            event!(
-                Level::TRACE,
-                "Sending ListObjectV2Request: {:x?}",
-                list_objects_request
-            );
-            let objects = self.client
-                .list_objects_v2(list_objects_request.clone())
-                .await
-                .map(|res| res.contents.unwrap_or_default());
-            event!(
-                Level::TRACE,
-                "Got ListObjectV2Request result result: {:?}",
-                objects
-            );
+        let objects = objects.unwrap();
 
-            // If we get an HTTP error (timeout, connexion reset, ...), just retry
-            if let Err(error) = objects {
-                match error {
-                    RusotoError::HttpDispatch(_) => {
-                        event!(Level::WARN, "Got error when listing objects: {:?}", error);
-                        retries += 1;
-                        continue;
-                    }
-                    _ => return Err(anyhow::Error::from(error)),
-                }
-            }
+        event!(Level::TRACE, "{:?}", objects.last());
 
-            let objects = objects.unwrap();
-
-            event!(Level::TRACE, "{:?}", objects.last());
-
-            return Ok(objects);
-        }
+        return Ok(objects);
     }
 
     #[instrument(skip(self), level = "debug")]
     pub async fn delete_object(
         &self,
         object: ProviderObject,
-    ) -> Result<ProviderObject, RusotoError<DeleteObjectError>> {
-        let delete_object_request = DeleteObjectRequest {
-            bucket: self
-                .bucket
-                .clone()
-                .expect("delete_object should have a bucket"),
-            key: object.get_key(),
-            ..Default::default()
-        };
-
+    ) -> Result<ProviderObject, SdkError<DeleteObjectError, HttpResponse>> {
         self.client
-            .delete_object(delete_object_request)
+            .delete_object()
+            .bucket(self.bucket.clone().expect("delete_object should have a bucket"))
+            .key(object.get_key())
+            .send()
             .await
             .map(|_| object)
     }
@@ -322,6 +267,7 @@ impl RadosGW {
     pub async fn list_buckets(&self) -> anyhow::Result<Vec<Bucket>> {
         self.client
             .list_buckets()
+            .send()
             .await
             .map_err(anyhow::Error::from)
             .map(|result| result.buckets.unwrap_or_default())
@@ -331,16 +277,13 @@ impl RadosGW {
     pub async fn create_bucket(
         &self,
         bucket: String,
-    ) -> Result<(), RusotoError<CreateBucketError>> {
+    ) -> Result<(), SdkError<CreateBucketError, HttpResponse>> {
         // TODO: check if original bucket is public and if it is, apply the same ACL here
         // There might also be some policies, we need to create them.
-        let create_bucket_request = CreateBucketRequest {
-            bucket,
-            ..Default::default()
-        };
-
         self.client
-            .create_bucket(create_bucket_request)
+            .create_bucket()
+            .bucket(bucket)
+            .send()
             .await
             .map(|_| ())
     }
@@ -349,17 +292,11 @@ impl RadosGW {
         &self,
         object: &ProviderObject,
     ) -> anyhow::Result<HeadObjectOutput> {
-        let head_object_request = HeadObjectRequest {
-            bucket: self
-                .bucket
-                .clone()
-                .expect("get_object_metadata should have a bucket"),
-            key: object.get_key(),
-            ..Default::default()
-        };
-
         self.client
-            .head_object(head_object_request)
+            .head_object()
+            .bucket(self.bucket.clone().expect("get_object_metadata should have a bucket"))
+            .key(object.get_key())
+            .send()
             .await
             .map_err(|error| {
                 anyhow!(
@@ -372,29 +309,23 @@ impl RadosGW {
 
     #[instrument(skip(self), level = "debug")]
     pub async fn get_object(&self, object: &ProviderObject) -> anyhow::Result<GetObjectOutput> {
-        let get_object_request = GetObjectRequest {
-            bucket: self
-                .bucket
-                .clone()
-                .expect("get_object should have a bucket"),
-            key: object.get_key(),
-            ..Default::default()
-        };
-
         self.client
-            .get_object(get_object_request)
+            .get_object()
+            .bucket(self.bucket.clone().expect("get_object should have a bucket"))
+            .key(object.get_key())
+            .send()
             .await
             .map_err(|error| anyhow!("Error fetching object {}: {:?}", object.get_key(), error))
     }
 }
 
 struct RadosGWResponseInner {
-    stream: ByteStream,
+    output: GetObjectOutput,
 }
 
 impl RadosGWResponseInner {
-    pub fn new(stream: ByteStream) -> RadosGWResponseInner {
-        RadosGWResponseInner { stream }
+    pub fn new(output: GetObjectOutput) -> RadosGWResponseInner {
+        RadosGWResponseInner { output }
     }
 }
 
@@ -405,20 +336,21 @@ impl Stream for RadosGWResponseInner {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.stream.poll_next_unpin(cx)
+        Pin::new(&mut self.output.body).poll_next(cx)
+            .map_err(Into::into)
     }
 }
 
 #[derive(Debug)]
 pub struct RadosGWResponse {
-    response: Option<Arc<Mutex<GetObjectOutput>>>,
+    response: Option<GetObjectOutput>,
     error: Option<anyhow::Error>,
 }
 
 impl RadosGWResponse {
     pub fn new(response: Result<GetObjectOutput, anyhow::Error>) -> RadosGWResponse {
         let (res, error) = match response {
-            Ok(res) => (Some(Arc::new(Mutex::new(res))), None),
+            Ok(res) => (Some(res), None),
             Err(err) => (None, Some(err)),
         };
         RadosGWResponse {
@@ -432,12 +364,24 @@ impl ProviderResponse for RadosGWResponse {
     fn status(&self) -> u16 {
         match &self.error {
             None => 200,
-            Some(err) => match err.downcast_ref::<GetObjectError>() {
-                Some(GetObjectError::NoSuchKey(_)) => 404,
-                Some(GetObjectError::InvalidObjectState(_)) => 500,
+            Some(err) => match err.downcast_ref::<SdkError<GetObjectError, HttpResponse>>() {
+                Some(downcast_error) => match downcast_error {
+                    SdkError::ServiceError(err) => match err.err() {
+                        GetObjectError::NoSuchKey(_) => 404,
+                        GetObjectError::InvalidObjectState(_) => 500,
+                        e => {
+                            error!("Unknown GetObjectError {:?}", e);
+                            500
+                        }
+                    }
+                    e => {
+                        error!("Unknown S3 error: {:?} on GetObjectError", e);
+                        500
+                    }
+                }
                 None => {
                     // Usually, network errors or stuff like that
-                    error!("Failed to downcast to a GetObjetError: {:?}", err);
+                    error!("Failed to downcast to a GetObjectError: {:?}", err);
                     500
                 }
             },
@@ -446,18 +390,13 @@ impl ProviderResponse for RadosGWResponse {
 
     fn body(
         &mut self,
-    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>
+    ) -> ProviderResponseStream
     {
         match &self.error {
             None => {
                 let response = self.response.take().expect("We should have a response");
 
-                let mut lock = response.lock().expect("Should lock");
-
-                match lock.body.take() {
-                    Some(body) => Box::pin(RadosGWResponseInner::new(body)),
-                    None => Box::pin(futures::stream::empty()),
-                }
+                Box::pin(RadosGWResponseInner::new(response))
             }
             Some(_) => Box::pin(futures::stream::empty()),
         }
@@ -466,21 +405,16 @@ impl ProviderResponse for RadosGWResponse {
     fn body_chunked(
         &mut self,
         chunk_size: usize,
-    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>
+    ) -> ProviderResponseStream
     {
         match &self.error {
             None => {
                 let response = self.response.take().expect("We should have a response");
 
-                let mut lock = response.lock().expect("Should lock");
-
-                match lock.body.take() {
-                    Some(body) => Box::pin(ProviderResponseStreamChunk::new(
-                        Box::pin(RadosGWResponseInner::new(body)),
-                        chunk_size,
-                    )),
-                    None => Box::pin(futures::stream::empty()),
-                }
+                Box::pin(ProviderResponseStreamChunk::new(
+                    Box::pin(RadosGWResponseInner::new(response)),
+                    chunk_size,
+                ))
             }
             Some(_) => Box::pin(futures::stream::empty()),
         }
@@ -525,7 +459,7 @@ impl Provider for RadosGW {
                 );
 
                 let objects: anyhow::Result<Vec<ProviderObject>> = self
-                    .list_objects(Some(max_results as i64), start_after.clone())
+                    .list_objects(Some(max_results as _), start_after.clone())
                     .await
                     .map(|res| res.iter().map(|object| object.into()).collect());
 

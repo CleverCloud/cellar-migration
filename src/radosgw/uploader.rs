@@ -5,16 +5,16 @@ use std::{
     task::{Context, Poll},
 };
 
+use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use futures::Stream;
 use hyper::body::HttpBody;
-use rusoto_core::ByteStream;
 use tokio::task::JoinError;
 use tracing::event;
 use tracing::Level;
 
 use crate::provider::{
-    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponseStreamChunkWrapper,
+    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponseStreamChunkWrapper, ProviderResponseHttp04X, ProviderResponseStream,
 };
 
 use super::RadosGW;
@@ -201,7 +201,7 @@ impl Uploader {
             let object_size = object.get_size() as usize;
 
             if object_size < multipart_chunk_size {
-                let body = ByteStream::new(response.body());
+                let body = ByteStream::from_body_0_4(ProviderResponseHttp04X::new(response.body()));
                 Uploader::sync_object_singlepart(
                     radosgw_client,
                     object,
@@ -290,7 +290,7 @@ impl Uploader {
         radosgw_client: &RadosGW,
         object: &ProviderObject,
         object_metadata: &ProviderObjectMetadata,
-        body: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        body: ProviderResponseStream,
         multipart_chunk_size: usize,
         thread_id: usize,
     ) -> anyhow::Result<()> {
@@ -320,15 +320,14 @@ impl Uploader {
                 part_size
             );
 
+            let chunk = ProviderResponseStreamChunkWrapper::new(body_wrapper.clone());
             let upload_part_response = radosgw_client
                 .put_object_part(
                     object.get_key(),
                     part_size as i64,
-                    ByteStream::new(ProviderResponseStreamChunkWrapper::new(
-                        body_wrapper.clone(),
-                    )),
+                    ByteStream::from_body_0_4(ProviderResponseHttp04X::new(Box::pin(chunk))),
                     multipart_upload_id.clone(),
-                    radosgw_part_number as i64,
+                    radosgw_part_number as _,
                 )
                 .await;
 

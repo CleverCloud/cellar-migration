@@ -3,18 +3,16 @@ mod provider;
 mod radosgw;
 mod riakcs;
 
-use std::str::FromStr;
-
 use bytesize::ByteSize;
 use clap::{value_parser, ArgAction};
 use clap::{Arg, ArgMatches, Command};
 use migrate::BucketMigrationConfiguration;
-use rusoto_core::Region;
 use tracing::event;
 use tracing::instrument;
 use tracing::Level;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
+use url::Url;
 
 use crate::migrate::{BucketMigrationError, BucketMigrationStats};
 use crate::provider::ProviderConf;
@@ -40,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
             .arg(Arg::new("source-bucket").long("source-bucket").help("Source bucket from which files will be copied. If omitted, all buckets of the add-on will be synchronized"))
             .arg(Arg::new("source-access-key").long("source-access-key").help("Source bucket Cellar access key").required(true))
             .arg(Arg::new("source-secret-key").long("source-secret-key").help("Source bucket Cellar secret key").required(true))
-            .arg(Arg::new("source-endpoint").long("source-endpoint").help("Source endpoint of the S3 Bucket"))
+            .arg(Arg::new("source-endpoint").long("source-endpoint").help("Source endpoint of the S3 Bucket").value_parser(value_parser!(Url)))
             .arg(Arg::new("source-provider").long("source-provider").help("Provider for source bucket (AWS, Ceph, RiakCS, ..)").required(true))
             .arg(Arg::new("source-region").long("source-region").help("Region of the source bucket (eu-west-1,..)"))
             .arg(Arg::new("destination-bucket").long("destination-bucket").help("Destination bucket to which the files will be copied. If omitted, the bucket will be created if it doesn't exist"))
@@ -48,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
             .arg(Arg::new("destination-access-key").long("destination-access-key").help("Destination bucket Cellar access key").required(true))
             .arg(Arg::new("destination-secret-key").long("destination-secret-key").help("Destination bucket Cellar secret key").required(true))
             .arg(Arg::new("destination-endpoint").long("destination-endpoint").help("Destination endpoint of the Cellar cluster. Defaults to Paris Cellar cluster")
-                .required(false).default_value("cellar-c2.services.clever-cloud.com")
+                .required(false).default_value("https://cellar-c2.services.clever-cloud.com").value_parser(value_parser!(Url))
             )
             .arg(
                 Arg::new("threads").long("threads").short('t').help("Number of threads used to synchronize this bucket")
@@ -120,8 +118,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         .unwrap()
         .to_string();
     let source_endpoint = params
-        .get_one::<String>("source-endpoint")
-        .map(|s| s.to_owned());
+        .get_one::<Url>("source-endpoint")
+        .map(Url::to_string);
     let source_region = params
         .get_one::<String>("source-region")
         .map(|s| s.to_owned());
@@ -148,7 +146,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         .unwrap()
         .to_string();
     let destination_endpoint = params
-        .get_one::<String>("destination-endpoint")
+        .get_one::<Url>("destination-endpoint")
+        .map(Url::to_string)
         .unwrap()
         .to_string();
 
@@ -164,16 +163,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
                 "You have to define either --source-endpoint or --source-region"
             );
             std::process::exit(1);
-        }
-        (None, Some(region)) => {
-            if Region::from_str(region).is_err() {
-                event!(
-                    Level::ERROR,
-                    "Failed to parse given region to --source-region"
-                );
-                std::process::exit(1);
-            }
-        }
+        },
         (Some(_), None) => {
             if let Providers::AwsS3 = source_provider {
                 event!(

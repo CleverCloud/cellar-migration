@@ -1,10 +1,10 @@
 use std::{cmp::Ordering, error, collections::VecDeque, sync::{Arc, Mutex}};
 
+use aws_sdk_s3::{error::SdkError, operation::{list_objects_v2::ListObjectsV2Error, create_bucket::CreateBucketError}};
+use aws_smithy_runtime_api::client::{orchestrator::HttpResponse};
 use bytesize::ByteSize;
 use futures::StreamExt;
 
-use rusoto_core::RusotoError;
-use rusoto_s3::{CreateBucketError, ListObjectsV2Error};
 use std::time::Duration;
 use tokio::task::JoinError;
 use tracing::{event, instrument, Level};
@@ -267,20 +267,30 @@ pub async fn migrate_bucket(
                                 dst_objects.extend(objects)
                             },
                             Some(Err(error)) => {
-                                match error.downcast_ref::<RusotoError<ListObjectsV2Error>>() {
-                                    Some(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(bucket))) => {
-                                        if conf.dry_run {
-                                            // This may be normal since the bucket may not exist yet
-                                            // treat it as empty
-                                            no_more_dst_objects = true;
-                                        } else {
-                                            unreachable!("We started migrating objects but dest bucket {} does not exist", bucket);
+                                match error.downcast::<SdkError<ListObjectsV2Error,HttpResponse>>() {
+                                    Ok(downcast_error) => match downcast_error.into_service_error() {
+                                        ListObjectsV2Error::NoSuchBucket(bucket) => {
+                                            if conf.dry_run {
+                                                // This may be normal since the bucket may not exist yet
+                                                // treat it as empty
+                                                no_more_dst_objects = true;
+                                            } else {
+                                                unreachable!("We started migrating objects but dest bucket {} does not exist", bucket);
+                                            }
+                                        },
+                                        error => {
+                                            event!(
+                                                Level::ERROR,
+                                                "Failed to fetch dest objects: {:?}",
+                                                error
+                                            );
+                                            anyhow::bail!(error);
                                         }
                                     },
-                                    _ => {
+                                    Err(error) => {
                                         event!(
                                             Level::ERROR,
-                                            "Failed to fetch dest objects: {:?}",
+                                            "Failed to fetch dest objects and downcast the error: {:?}",
                                             error
                                         );
                                         anyhow::bail!(error);
@@ -536,13 +546,15 @@ pub async fn create_destination_buckets(
 
             match client_dry_run.list_objects(Some(1), None).next().await {
                 Some(Ok(_)) | None => {}
-                Some(Err(error)) => match error.downcast::<RusotoError<_>>() {
-                    Ok(RusotoError::Service(ListObjectsV2Error::NoSuchBucket(_))) => {
-                        event!(Level::INFO, "DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
-                    }
-                    Ok(e) => {
-                        bucket_already_created(&destination_bucket);
-                        return Err(anyhow::Error::from(e));
+                Some(Err(error)) => match error.downcast::<SdkError<ListObjectsV2Error,HttpResponse>>() {
+                    Ok(downcast_error) => match downcast_error.into_service_error() {
+                        ListObjectsV2Error::NoSuchBucket(_) => {
+                            event!(Level::INFO, "DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
+                        },
+                        e => {
+                            bucket_already_created(&destination_bucket);
+                            return Err(anyhow::Error::from(e));
+                        }
                     }
                     Err(downcast) => {
                         panic!("Failed to downcast error to a RusotoError: {:?}", downcast)
@@ -557,17 +569,27 @@ pub async fn create_destination_buckets(
             );
 
             match client.create_bucket(destination_bucket.clone()).await {
-                Ok(_)
-                | Err(RusotoError::Service(CreateBucketError::BucketAlreadyOwnedByYou(_))) => {
+                Ok(_) => {
                     event!(
                         Level::INFO,
                         "Bucket {} | Bucket created",
                         destination_bucket
                     )
                 }
-                Err(e) => {
-                    bucket_already_created(&destination_bucket);
-                    return Err(anyhow::Error::from(e));
+                Err(error) => {
+                    match error.into_service_error() {
+                        CreateBucketError::BucketAlreadyOwnedByYou(_) => {
+                            event!(
+                                Level::INFO,
+                                "Bucket {} | Bucket created",
+                                destination_bucket
+                            )
+                        },
+                        e => {
+                            bucket_already_created(&destination_bucket);
+                            return Err(anyhow::Error::from(e));
+                        }
+                    }
                 }
             };
         }

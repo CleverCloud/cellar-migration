@@ -97,7 +97,7 @@ For automatic migrations. Recommended for huge buckets.
 ```
 CC_CACHE_DEPENDENCIES="true"
 CC_RUST_BIN="http-server"
-CC_WORKER_COMMAND="cargo run --bin cellar-migration --release -- migrate --source-access-key <src_access_key> --source-secret-key <src_secret_key> --source-bucket <src_bucket> --source-endpoint <src_endpoint> --source-provider <src_provider> --source-region <src_region> --destination-access-key <dst_access_key> --destination-secret-key <dst_secret_key> --destination-bucket <dst_bucket> --destination-endpoint cellar-c2.services.clever-cloud.com --threads [number]"
+CC_WORKER_COMMAND="cargo run --bin cellar-migration --release -- migrate --source-access-key <src_access_key> --source-secret-key <src_secret_key> --source-bucket <src_bucket> --source-endpoint <src_endpoint> --source-provider <src_provider> --source-region <src_region> --destination-access-key <dst_access_key> --destination-secret-key <dst_secret_key> --destination-bucket <dst_bucket> --destination-endpoint https://cellar-c2.services.clever-cloud.com --threads [number]"
 CC_WORKER_RESTART_DELAY="60"
 PORT="8080"
 ```
@@ -111,7 +111,7 @@ Don't forget to modifiy the `CC_WORKER_COMMAND` with your own credentials, where
 This step is when you take the Cellar credentials you saved and insert it in the command options. An example of what `CC_WORKER_COMMAND`  for migrating from AWS to Clever Cloud would look like this:
 
 ```shell
---source-access-key <s3_access_key> --source-secret-key <s3_secret_key> --source-bucket <s3_bucket_name> --source-endpoint s3.amazonaws.com --source-provider aws-s3 --source-region <src_region> --destination-access-key <cellar_key_id> --destination-secret-key <cellar_key_secret> --destination-bucket <cellar_bucket_name> --destination-endpoint cellar-c2.services.clever-cloud.com --threads 16"
+--source-access-key <s3_access_key> --source-secret-key <s3_secret_key> --source-bucket <s3_bucket_name> --source-endpoint https://s3.amazonaws.com --source-provider aws-s3 --source-region <src_region> --destination-access-key <cellar_key_id> --destination-secret-key <cellar_key_secret> --destination-bucket <cellar_bucket_name> --destination-endpoint https://cellar-c2.services.clever-cloud.com --threads 16"
 ```
 
 Save changes and click on **Next**. If you're deploying from GitHub, the app will automatically start. If you are using Git, copy the commands from the console to push from your repository.
@@ -158,11 +158,11 @@ main() {
     cellar-migration migrate \
       --execute \
       --source-bucket "${bucket}" \
-      --source-endpoint "s3.amazonaws.com" \
+      --source-endpoint "https://s3.amazonaws.com" \
       --source-region "<eg: eu-west-1, etc>" \
       --source-provider "aws-s3" \
       --destination-bucket "${destination_bucket}" \
-      --destination-endpoint "cellar-c2.services.clever-cloud.com" \
+      --destination-endpoint "https://cellar-c2.services.clever-cloud.com" \
       --source-access-key "<source_key>" \
       --source-secret-key "<source_secret>" \
       --destination-access-key "<destination_key>" \

@@ -4,7 +4,6 @@ use crate::{S3TestClient, TestFile};
 use aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::types::Permission;
-use aws_smithy_types_convert::date_time::DateTimeExt;
 use chrono::{DateTime, Utc};
 
 /// Verification result for comparing source and destination objects
@@ -263,8 +262,9 @@ impl MigrationVerifier {
         // Verify Expires header when provided
         if let Some(expected_expires) = &test_file.expires {
             let src_expires = src_metadata
-                .expires()
-                .and_then(|dt| dt.clone().to_chrono_utc().ok());
+                .expires_string()
+                .and_then(|s| DateTime::parse_from_rfc2822(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
             if !expires_matches(expected_expires, src_expires.as_ref()) {
                 return Some(format!(
                     "Source Expires mismatch: expected {}, got {:?}",
@@ -273,8 +273,9 @@ impl MigrationVerifier {
             }
 
             let dst_expires = dst_metadata
-                .expires()
-                .and_then(|dt| dt.clone().to_chrono_utc().ok());
+                .expires_string()
+                .and_then(|s| DateTime::parse_from_rfc2822(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
             if !expires_matches(expected_expires, dst_expires.as_ref()) {
                 return Some(format!(
                     "Destination Expires mismatch: expected {}, got {:?}",

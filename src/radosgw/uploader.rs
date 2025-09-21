@@ -8,13 +8,15 @@ use std::{
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use futures::Stream;
-use hyper::body::HttpBody;
+use http_body::Body;
+use hyper::body::Incoming;
 use tokio::task::JoinError;
 use tracing::event;
 use tracing::Level;
 
 use crate::provider::{
-    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponseStreamChunkWrapper, ProviderResponseHttp04X, ProviderResponseStream,
+    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponseHttp04X,
+    ProviderResponseStream, ProviderResponseStreamChunkWrapper,
 };
 
 use super::RadosGW;
@@ -201,7 +203,13 @@ impl Uploader {
             let object_size = object.get_size() as usize;
 
             if object_size < multipart_chunk_size {
-                let body = ByteStream::from_body_0_4(ProviderResponseHttp04X::new(response.body()));
+                // Create ByteStream from the response body with known size to avoid UnsizedRequestBody errors
+                let body_http04x = ProviderResponseHttp04X::with_exact_size(
+                    response.body(),
+                    object_size,
+                );
+                let body = ByteStream::from_body_1_x(body_http04x);
+
                 Uploader::sync_object_singlepart(
                     radosgw_client,
                     object,
@@ -321,11 +329,15 @@ impl Uploader {
             );
 
             let chunk = ProviderResponseStreamChunkWrapper::new(body_wrapper.clone());
+            let part_body = ByteStream::from_body_1_x(ProviderResponseHttp04X::with_exact_size(
+                Box::pin(chunk),
+                part_size,
+            ));
             let upload_part_response = radosgw_client
                 .put_object_part(
                     object.get_key(),
                     part_size as i64,
-                    ByteStream::from_body_0_4(ProviderResponseHttp04X::new(Box::pin(chunk))),
+                    part_body,
                     multipart_upload_id.clone(),
                     radosgw_part_number as _,
                 )
@@ -443,12 +455,12 @@ impl std::fmt::Display for DownloadError {
 }
 
 pub struct RiakResponseStream {
-    response: hyper::Response<hyper::Body>,
+    body: Incoming,
 }
 
 impl RiakResponseStream {
-    pub fn new(response: hyper::Response<hyper::Body>) -> RiakResponseStream {
-        RiakResponseStream { response }
+    pub fn new(body: Incoming) -> RiakResponseStream {
+        RiakResponseStream { body }
     }
 }
 
@@ -456,14 +468,21 @@ impl Stream for RiakResponseStream {
     type Item = Result<Bytes, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.response).poll_data(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Ok(body))) => Poll::Ready(Some(Ok(body))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                error.to_string(),
-            )))),
+        loop {
+            match Pin::new(&mut self.body).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(body) => return Poll::Ready(Some(Ok(body))),
+                    Err(_) => continue,
+                },
+                Poll::Ready(Some(Err(error))) => {
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        error,
+                    ))))
+                }
+            }
         }
     }
 }

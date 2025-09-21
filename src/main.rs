@@ -89,7 +89,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         event!(Level::WARN, "Running in dry run mode. No changes will be made. If you want to synchronize for real, use --execute");
     }
 
-    unsafe { increase_limits()}?;
+    unsafe { increase_limits() }?;
 
     let sync_threads: usize = *params
         .get_one::<usize>("threads")
@@ -117,9 +117,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
         .get_one::<String>("source-secret-key")
         .unwrap()
         .to_string();
-    let source_endpoint = params
-        .get_one::<Url>("source-endpoint")
-        .map(Url::to_string);
+    let source_endpoint = params.get_one::<Url>("source-endpoint").map(Url::to_string);
     let source_region = params
         .get_one::<String>("source-region")
         .map(|s| s.to_owned());
@@ -163,7 +161,7 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
                 "You have to define either --source-endpoint or --source-region"
             );
             std::process::exit(1);
-        },
+        }
         (Some(_), None) => {
             if let Providers::AwsS3 = source_provider {
                 event!(
@@ -402,27 +400,45 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
 unsafe fn increase_limits() -> anyhow::Result<()> {
     let mut limits = libc::rlimit {
         rlim_cur: 0,
-        rlim_max: 0
+        rlim_max: 0,
     };
 
     if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) < 0 {
         let error = libc::strerror(*libc::__errno_location());
         let len = libc::strlen(error);
-        let error_msg = String::from_utf8(Vec::from_raw_parts(error as _, len, len)).expect("We should have an UTF-8 error");
-        anyhow::bail!(format!("Failed to get file descriptors limit: {}", error_msg));
+        let error_msg = String::from_utf8(Vec::from_raw_parts(error as _, len, len))
+            .expect("We should have an UTF-8 error");
+        anyhow::bail!(format!(
+            "Failed to get file descriptors limit: {}",
+            error_msg
+        ));
     }
 
-    event!(Level::DEBUG, "Current file descriptors limit: {}, max limit: {}", limits.rlim_cur, limits.rlim_max);
+    event!(
+        Level::DEBUG,
+        "Current file descriptors limit: {}, max limit: {}",
+        limits.rlim_cur,
+        limits.rlim_max
+    );
 
     if limits.rlim_cur < limits.rlim_max {
         limits.rlim_cur = limits.rlim_max;
-        event!(Level::DEBUG, "Increasing file descriptors limit from {} to {}", limits.rlim_cur, limits.rlim_max);
+        event!(
+            Level::DEBUG,
+            "Increasing file descriptors limit from {} to {}",
+            limits.rlim_cur,
+            limits.rlim_max
+        );
 
         if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) < 0 {
             let error = libc::strerror(*libc::__errno_location());
             let len = libc::strlen(error);
-            let error_msg = String::from_utf8(Vec::from_raw_parts(error as _, len, len)).expect("We should have an UTF-8 error");
-            anyhow::bail!(format!("Failed to increase file descriptors limit: {}", error_msg));
+            let error_msg = String::from_utf8(Vec::from_raw_parts(error as _, len, len))
+                .expect("We should have an UTF-8 error");
+            anyhow::bail!(format!(
+                "Failed to increase file descriptors limit: {}",
+                error_msg
+            ));
         }
     }
 

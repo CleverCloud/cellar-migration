@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc, TimeZone};
-use hyper::{Body, Response};
+use chrono::{DateTime, TimeZone, Utc};
+use hyper::{body::Incoming, Response};
 
 use serde_derive::Deserialize;
 
@@ -91,7 +91,7 @@ pub struct ObjectMetadata {
 }
 
 impl ObjectMetadata {
-    fn extract_header(response: &Response<Body>, header: &str) -> Option<String> {
+    fn extract_header(response: &Response<Incoming>, header: &str) -> Option<String> {
         response.headers().get(header).map(|v| {
             v.to_str()
                 .unwrap_or_else(|_| panic!("{} header should be a valid string", header))
@@ -100,14 +100,15 @@ impl ObjectMetadata {
     }
 }
 
-impl From<Response<Body>> for ObjectMetadata {
-    fn from(response: Response<Body>) -> Self {
+impl From<Response<Incoming>> for ObjectMetadata {
+    fn from(response: Response<Incoming>) -> Self {
         ObjectMetadata {
             last_modified: response.headers().get("last-modified").map(|lm| {
                 let date = DateTime::parse_from_rfc2822(
                     lm.to_str()
                         .expect("Last Modified header should be a valid string"),
-                ).expect("Last Modified header should be a valid UTC date");
+                )
+                .expect("Last Modified header should be a valid UTC date");
                 Utc.from_utc_datetime(&date.naive_utc())
             }),
             etag: Self::extract_header(&response, "etag").map(|etag| etag.replace('\"', "")),

@@ -301,12 +301,10 @@ async fn run_migration_with_invalid_credentials_cli(
     chunk_size_mb: usize,
     thread_count: usize,
 ) -> Result<std::process::ExitStatus, Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("cargo");
+    let binary_path = get_binary_path("cellar-migration")
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let mut cmd = Command::new(&binary_path);
     cmd.args([
-        "run",
-        "--bin",
-        "cellar-migration",
-        "--",
         "migrate",
         "--source-access-key",
         &config.src_access_key,

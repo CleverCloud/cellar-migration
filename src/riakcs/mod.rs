@@ -5,27 +5,33 @@ use std::pin::Pin;
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::Engine;
-use bytes::{BufMut, BytesMut};
+use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use dto::{ListObjectResponse, ObjectContents};
 use futures::Stream;
-use hyper::{body::HttpBody, Body, Client, Method, Response, StatusCode};
+use http_body_util::{BodyExt, Empty};
+use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_tls::HttpsConnector;
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use ring::hmac;
 use serde::Deserialize;
-use serde_xml_rs::{de::Deserializer, ParserConfig};
+use serde_xml_rs::de::Deserializer;
 use tracing::{event, instrument, Level};
+use xml::reader::ParserConfig;
 
 use crate::{
     provider::{
-        Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse,
-        ProviderResponseStreamChunk, ProviderResponseStream,
+        Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse, ProviderResponseStream,
+        ProviderResponseStreamChunk,
     },
     radosgw::uploader::RiakResponseStream,
     riakcs::dto::ListBucketsResult,
 };
 
 use self::dto::{ListBucket, ObjectMetadata, ObjectMetadataResponse};
+
+type RequestBody = Empty<Bytes>;
+type ResponseBody = Incoming;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -96,7 +102,7 @@ impl RiakCS {
         base64::engine::general_purpose::STANDARD_NO_PAD.encode(computed_hash.as_ref())
     }
 
-    fn sign_request(&self, req: &mut hyper::Request<Body>) {
+    fn sign_request(&self, req: &mut Request<RequestBody>) {
         let mut to_sign: Vec<String> = Vec::new();
         let now = Utc::now().to_rfc2822();
         req.headers_mut().append("x-amz-date", now.parse().unwrap());
@@ -166,39 +172,36 @@ impl RiakCS {
     }
 
     #[instrument(skip(self, req), level = "debug")]
-    async fn send_request_deser<'de, T>(&self, req: hyper::Request<Body>) -> Result<T>
+    async fn send_request_deser<'de, T>(&self, req: Request<RequestBody>) -> Result<T>
     where
         T: Deserialize<'de>,
     {
         let uri = req.uri().to_string();
-        let mut response = self.send_request(req).await?;
-        let mut body = BytesMut::new();
-        while let Some(data) = response.body_mut().data().await {
-            body.put(data?);
-        }
-
-        let data_str = String::from_utf8_lossy(&body[..]);
+        let response = self.send_request(req).await?;
+        let status = response.status();
+        let body_bytes = response.into_body().collect().await?.to_bytes();
+        let data_str = String::from_utf8_lossy(&body_bytes);
         event!(Level::TRACE, "{}", data_str);
 
         let reader = ParserConfig::default()
             .trim_whitespace(false)
             .create_reader(data_str.as_bytes());
-        if response.status().is_success() {
+        if status.is_success() {
             let deser = T::deserialize(&mut Deserializer::new(reader))?;
             Ok(deser)
         } else {
             Err(anyhow::Error::from(RiakCSError::new(
                 uri,
-                response.status().as_u16(),
+                status.as_u16(),
                 Some(data_str.to_string()),
             )))
         }
     }
 
     #[instrument(skip(self, req), level = "debug")]
-    async fn send_request(&self, req: hyper::Request<Body>) -> Result<Response<Body>> {
+    async fn send_request(&self, req: Request<RequestBody>) -> Result<Response<ResponseBody>> {
         let https = HttpsConnector::new();
-        let client = Client::builder().build::<_, hyper::Body>(https);
+        let client = Client::builder(TokioExecutor::new()).build::<_, RequestBody>(https);
 
         event!(
             Level::TRACE,
@@ -231,10 +234,10 @@ impl RiakCS {
             );
 
             event!(Level::TRACE, "Build request with uri: {}", uri);
-            let mut req = hyper::Request::builder()
+            let mut req = Request::builder()
                 .method(Method::GET)
                 .uri(uri)
-                .body(Body::empty())?;
+                .body(RequestBody::new())?;
 
             self.sign_request(&mut req);
             event!(Level::TRACE, "{:#?}", req);
@@ -279,13 +282,13 @@ impl RiakCS {
     }
 
     #[instrument(skip(self), level = "debug")]
-    pub async fn get_object(&self, object: &ProviderObject) -> Result<Response<Body>> {
+    pub async fn get_object(&self, object: &ProviderObject) -> Result<Response<ResponseBody>> {
         let url = self.get_download_url(object);
 
-        let req = hyper::Request::builder()
+        let req = Request::builder()
             .method(Method::GET)
             .uri(url)
-            .body(Body::empty())?;
+            .body(RequestBody::new())?;
 
         self.send_request(req).await
     }
@@ -293,20 +296,16 @@ impl RiakCS {
     #[allow(dead_code)]
     pub async fn get_object_acl(&self, object: &ObjectContents) -> Result<()> {
         let uri = format!("{}/{}?acl", self.get_uri(), object.get_key());
-        let mut req = hyper::Request::builder()
+        let mut req = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .body(Body::empty())?;
+            .body(RequestBody::new())?;
 
         self.sign_request(&mut req);
 
-        let mut response = self.send_request(req).await?;
-        let mut body = BytesMut::new();
-        while let Some(data) = response.body_mut().data().await {
-            body.put(data?);
-        }
-
-        let data_str = String::from_utf8_lossy(&body[..]);
+        let response = self.send_request(req).await?;
+        let data = response.into_body().collect().await?.to_bytes();
+        let data_str = String::from_utf8_lossy(&data);
         event!(Level::TRACE, "{}", data_str);
 
         Ok(())
@@ -330,10 +329,10 @@ impl RiakCS {
         // So the loop will only loop once maximum
         // See rustc --explain E0733
         loop {
-            let mut req = hyper::Request::builder()
+            let mut req = Request::builder()
                 .method(Method::HEAD)
                 .uri(uri.clone())
-                .body(Body::empty())?;
+                .body(RequestBody::new())?;
 
             if use_signature {
                 self.sign_request(&mut req);
@@ -368,10 +367,10 @@ impl RiakCS {
 
     pub async fn list_buckets(&self) -> Result<Vec<ListBucket>> {
         let uri = self.get_uri();
-        let mut req = hyper::Request::builder()
+        let mut req = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .body(Body::empty())?;
+            .body(RequestBody::new())?;
 
         self.sign_request(&mut req);
         let response: ListBucketsResult = self.send_request_deser(req).await?;
@@ -441,12 +440,12 @@ impl Provider for RiakCS {
 
 #[derive(Debug)]
 struct RiakCSResponse {
-    response: Option<Response<Body>>,
+    response: Option<Response<ResponseBody>>,
     status: StatusCode,
 }
 
 impl RiakCSResponse {
-    pub fn new(response: Response<Body>) -> RiakCSResponse {
+    pub fn new(response: Response<ResponseBody>) -> RiakCSResponse {
         let status = response.status();
         RiakCSResponse {
             response: Some(response),
@@ -460,21 +459,22 @@ impl ProviderResponse for RiakCSResponse {
         self.status.as_u16()
     }
 
-    fn body(
-        &mut self,
-    ) -> ProviderResponseStream {
+    fn body(&mut self) -> ProviderResponseStream {
         Box::pin(RiakResponseStream::new(
-            self.response.take().expect("We should have a response"),
+            self.response
+                .take()
+                .expect("We should have a response")
+                .into_body(),
         ))
     }
 
-    fn body_chunked(
-        &mut self,
-        chunk_size: usize,
-    ) -> ProviderResponseStream {
+    fn body_chunked(&mut self, chunk_size: usize) -> ProviderResponseStream {
         Box::pin(ProviderResponseStreamChunk::new(
             Box::pin(RiakResponseStream::new(
-                self.response.take().expect("We should have a response"),
+                self.response
+                    .take()
+                    .expect("We should have a response")
+                    .into_body(),
             )),
             chunk_size,
         ))

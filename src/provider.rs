@@ -7,12 +7,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use aws_smithy_types_convert::date_time::DateTimeExt;
+use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use dyn_clone::DynClone;
 use futures::{Stream, StreamExt};
-use tracing::{event, instrument, Level};
-use aws_smithy_types_convert::date_time::DateTimeExt;
+use http_body::Frame;
+use tracing::{error, event, instrument, Level};
 
 use crate::{
     radosgw::RadosGW,
@@ -91,7 +93,14 @@ impl From<&aws_sdk_s3::types::Object> for ProviderObject {
             key: value.key.clone().expect("Object key shouldn't be null"),
             last_modified: value
                 .last_modified
-                .map(|e| e.to_chrono_utc().unwrap_or_else(|_| panic!("Should be able to transform AWS datetime {:?} to chrono datetime", e)))
+                .map(|e| {
+                    e.to_chrono_utc().unwrap_or_else(|_| {
+                        panic!(
+                            "Should be able to transform AWS datetime {:?} to chrono datetime",
+                            e
+                        )
+                    })
+                })
                 .expect("Object last_modified shouldn't be null"),
             etag: value.e_tag.clone().expect("Object ETag shouldn't be null"),
             size: value.size.expect("Object size shouldn't be null") as u64,
@@ -158,9 +167,42 @@ impl From<ObjectMetadataResponse> for ProviderObjectMetadata {
 
 impl From<aws_sdk_s3::operation::head_object::HeadObjectOutput> for ProviderObjectMetadata {
     fn from(value: aws_sdk_s3::operation::head_object::HeadObjectOutput) -> Self {
+        let expires = value.expires_string().and_then(|s| {
+            DateTime::parse_from_rfc2822(s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| {
+                    panic!(
+                        "Should be able to parse expires string '{}' to datetime: {:?}",
+                        s, e
+                    )
+                })
+                .ok()
+        });
+
+        // Extract content_md5 from etag before moving value
+        let content_md5 = value.e_tag().and_then(|etag| {
+            // ETag is often the MD5 hash in hex quotes, convert to base64 for Content-MD5
+            if etag.starts_with('"') && etag.ends_with('"') && !etag.contains('-') {
+                let hex_md5 = etag.trim_matches('"');
+                // Convert hex to bytes, then to base64
+                hex::decode(hex_md5).ok().map(|bytes| {
+                    base64::engine::general_purpose::STANDARD.encode(&bytes)
+                })
+            } else {
+                None
+            }
+        });
+
         ProviderObjectMetadata {
             acl_public: false,
-            last_modified: value.last_modified.map(|date| date.to_chrono_utc().unwrap_or_else(|_| panic!("Should be able to transfom AWS datetime {:?} to chrono datetime", date))),
+            last_modified: value.last_modified.map(|date| {
+                date.to_chrono_utc().unwrap_or_else(|_| {
+                    panic!(
+                        "Should be able to transfom AWS datetime {:?} to chrono datetime",
+                        date
+                    )
+                })
+            }),
             etag: value.e_tag,
             content_type: value.content_type,
             content_length: value
@@ -170,16 +212,15 @@ impl From<aws_sdk_s3::operation::head_object::HeadObjectOutput> for ProviderObje
             content_disposition: value.content_disposition,
             content_encoding: value.content_encoding,
             content_language: value.content_language,
-            content_md5: None,
-            expires: value.expires.map(|date| date.to_chrono_utc().unwrap_or_else(|_| panic!("Should be able to transform AWS datetime {:?} to chrono datetime", date))),
+            content_md5,
+            expires,
         }
     }
 }
 
 pub(crate) type ProviderResponseStream =
     Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + Sync>>;
-pub (crate) type ProviderResponseStreamInner =
-    Arc<Mutex<ProviderResponseStream>>;
+pub(crate) type ProviderResponseStreamInner = Arc<Mutex<ProviderResponseStream>>;
 
 /// This struct exists so we can share a single RiakResponseStreamChunk
 /// that will be fed to multiple ByteStream instances, without losing the
@@ -204,12 +245,16 @@ impl Stream for ProviderResponseStreamChunkWrapper {
 
 pub(crate) struct ProviderResponseHttp04X {
     stream: ProviderResponseStream,
+    size: u64,
+    bytes_sent: u64,
 }
 
 impl ProviderResponseHttp04X {
-    pub fn new(stream: ProviderResponseStream) -> Self {
+    pub fn with_exact_size(stream: ProviderResponseStream, size: usize) -> Self {
         Self {
             stream,
+            size: size as u64,
+            bytes_sent: 0,
         }
     }
 }
@@ -218,28 +263,54 @@ impl http_body::Body for ProviderResponseHttp04X {
     type Data = Bytes;
     type Error = std::io::Error;
 
-    fn poll_data(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
-            self.stream.poll_next_unpin(cx)
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        match this.stream.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                let projected = this.bytes_sent + chunk.len() as u64;
+                if projected > this.size {
+                    error!(
+                        expected = this.size,
+                        received = projected,
+                        "ProviderResponseHttp04X produced more bytes than expected"
+                    );
+                }
+                this.bytes_sent = this.bytes_sent.saturating_add(chunk.len() as u64);
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
+            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(None) => {
+                if this.bytes_sent != this.size {
+                    error!(
+                        expected = this.size,
+                        sent = this.bytes_sent,
+                        "ProviderResponseHttp04X ended before sending expected bytes"
+                    );
+                }
+                this.bytes_sent = this.size;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 
-    fn poll_trailers(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<Option<hyper::HeaderMap>, Self::Error>> {
-        unimplemented!("ProviderResponseHttp04X::poll_trailers unimplemented")
+    fn size_hint(&self) -> http_body::SizeHint {
+        let remaining = self.size.saturating_sub(self.bytes_sent);
+        http_body::SizeHint::with_exact(remaining)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.bytes_sent >= self.size
     }
 }
 
 pub trait ProviderResponse: Debug + Send + Sync {
     fn status(&self) -> u16;
     fn body(&mut self) -> ProviderResponseStream;
-    fn body_chunked(
-        &mut self,
-        chunk_size: usize,
-    ) -> ProviderResponseStream;
+    fn body_chunked(&mut self, chunk_size: usize) -> ProviderResponseStream;
 }
 
 impl dyn ProviderResponse {
@@ -349,10 +420,7 @@ pub struct ProviderResponseStreamChunk {
 }
 
 impl ProviderResponseStreamChunk {
-    pub fn new(
-        response: ProviderResponseStream,
-        chunk_size: usize,
-    ) -> ProviderResponseStreamChunk {
+    pub fn new(response: ProviderResponseStream, chunk_size: usize) -> ProviderResponseStreamChunk {
         ProviderResponseStreamChunk {
             response,
             chunk_size,

@@ -1,3 +1,47 @@
+[workspace]
+members = [
+    ".",
+    "tests/test-common"
+]
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+aws-config = { version = "1.8.6", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.106.0"
+aws-smithy-runtime-api = "1.9.0"
+aws-smithy-types = { version = "1.3.2", features = ["http-body-1-x", "byte-stream-poll-next"] }
+aws-smithy-types-convert = { version = "0.60.9", features = ["convert-chrono"] }
+aws-credential-types = { version = "1.2.6", features = ["hardcoded-credentials"] }
+tokio = { version = "1.47", features = ["full"] }
+http-body = "1.0"
+hyper = { version = "1.7", features = ["client", "server", "http1", "http2"] }
+hyper-tls = { version = "0.6", features = ["vendored"] }
+hyper-util = { version = "0.1.17", features = ["client", "http1", "http2", "server", "server-auto", "tokio"] }
+http-body-util = "0.1.3"
+base64 = "0.22.1"
+hex = "0.4"
+urlencoding = "2.1.0"
+ring = "0.17"
+chrono = "0.4.42"
+serde-xml-rs = "0.8.1"
+xml-rs = "0.8.27"
+serde = "1.0.226"
+serde_derive = "1.0.226"
+anyhow = "1.0.100"
+futures = "0.3.31"
+bytes = "1.10.1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+env_logger = "0.11"
+clap = { version = "4.1", features = ["cargo", "suggestions"] }
+num_cpus = "1.13"
+libc = "0.2.175"
+dyn-clone = "1.0.20"
+bytesize = "2.1"
+url = "2.5"
+md5 = "0.7"
+rand = "0.8"
+
 [package]
 name = "cellar-migration"
 version = "2.1.0"
@@ -12,42 +56,46 @@ path = "src/main.rs"
 name = "http-server"
 path = "src/http-server.rs"
 
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-trait = "0.1.51"
-aws-config = { version = "1.1.1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.11.0"
-aws-smithy-runtime-api = "1.1.1"
-aws-smithy-types = { version = "1.1.1", features = ["http-body-0-4-x", "byte-stream-poll-next"] }
-aws-smithy-types-convert = { version = "0.60.1", features = ["convert-chrono"] }
-aws-credential-types = { version = "1.1.1", features = ["hardcoded-credentials"] }
-tokio = { version = "1", features = ["full"] }
-http-body = "0.4"
-hyper = { version = "0.14.15", features = ["client", "stream", "server"] }
-hyper-tls = { version = "0.5.0", features = ["vendored"] }
-base64 = "0.21.0"
-urlencoding = "2.1.0"
-ring = "0.17"
-chrono = "0.4.19"
-serde-xml-rs = "0.6"
-serde = "1.0.130"
-serde_derive = "1.0.130"
-anyhow = "1.0.51"
-futures = "0.3"
-bytes = "1.1.0"
-tracing = "0.1.29"
-tracing-subscriber = { version = "0.3.7", features = ["env-filter"] }
-env_logger = "^0.10"
-clap = { version = "4.1", features = ["cargo", "suggestions"] }
-num_cpus = "1.13"
-bytesize = "1.1"
-dyn-clone = "1.0.10"
-libc = "0.2"
-url = "2.5"
+async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true }
+aws-smithy-types-convert = { workspace = true }
+aws-credential-types = { workspace = true }
+tokio = { workspace = true }
+http-body = { workspace = true }
+hyper = { workspace = true }
+hyper-tls = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+urlencoding = { workspace = true }
+ring = { workspace = true }
+chrono = { workspace = true }
+serde-xml-rs = { workspace = true }
+# To update to ^1.0 when serde-xml-rs has updated. And rename to `xml = `
+xml-rs = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+env_logger = { workspace = true }
+clap = { workspace = true }
+num_cpus = { workspace = true }
+libc = { workspace = true }
+dyn-clone = { workspace = true }
+bytesize = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
-md5 = "0.7"
-rand = "0.8"
+md5 = { workspace = true }
+rand = { workspace = true }
 test-common = { path = "tests/test-common" }

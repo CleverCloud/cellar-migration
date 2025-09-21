@@ -9,3 +9,6 @@ pub use file_generator::*;
 pub use migration_runner::*;
 pub use s3_test_utils::*;
 pub use verification::*;
+
+// Re-export the binary path helper for use in other test files
+pub use migration_runner::get_binary_path;

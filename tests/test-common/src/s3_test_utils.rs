@@ -7,11 +7,12 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+use base64::Engine;
 use std::error::Error;
 use std::path::Path;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
-use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
 /// S3 test client wrapper with utilities for testing
 pub struct S3TestClient {
@@ -21,29 +22,45 @@ pub struct S3TestClient {
 impl S3TestClient {
     /// Create a new S3 test client for source bucket operations
     pub async fn new_source(config: TestConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let credentials = Credentials::new(
-            &config.src_access_key,
-            &config.src_secret_key,
+        // Use the same approach as the main migration tool's RadosGW client
+        use aws_config::{
+            retry::RetryConfig, retry::RetryMode, timeout::TimeoutConfig, BehaviorVersion,
+            SdkConfig,
+        };
+        use aws_sdk_s3::config::retry::RetryConfigBuilder;
+
+        let creds = Credentials::from_keys(
+            config.src_access_key.clone(),
+            config.src_secret_key.clone(),
             None,
-            None,
-            "test",
         );
+        let timeout_config = TimeoutConfig::builder()
+            .operation_timeout(std::time::Duration::from_secs(30))
+            .operation_attempt_timeout(std::time::Duration::from_secs(600))
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .build();
+        let retry_config = RetryConfigBuilder::new()
+            .mode(RetryMode::Standard)
+            .max_attempts(5)
+            .build();
+        let mut sdk_config = SdkConfig::builder()
+            .retry_config(retry_config)
+            .timeout_config(timeout_config);
 
-        let s3_config_builder = Config::builder()
-            .credentials_provider(credentials)
-            .endpoint_url(&config.src_endpoint)
-            .region(aws_sdk_s3::config::Region::new(config.src_region.clone()))
-            .behavior_version(BehaviorVersion::latest())
-            .force_path_style(config.src_path_style)
-            // Configure timeouts to handle stale connections
-            .timeout_config(
-                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-                    .operation_timeout(Duration::from_secs(60))
-                    .operation_attempt_timeout(Duration::from_secs(30))
-                    .build(),
-            );
+        let region = aws_sdk_s3::config::Region::new("us-east-1".to_string()); // Use us-east-1 for Cellar compatibility
+        sdk_config
+            .set_region(region)
+            .set_endpoint_url(Some(config.src_endpoint.clone()));
 
-        let s3_config = s3_config_builder.build();
+        let sdk_config = sdk_config.build();
+        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .credentials_provider(creds)
+            .behavior_version(BehaviorVersion::v2023_11_09())
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .force_path_style(true)
+            .build();
         let client = Client::from_conf(s3_config);
 
         Ok(Self { client })
@@ -51,29 +68,45 @@ impl S3TestClient {
 
     /// Create a new S3 test client for destination bucket operations
     pub async fn new_destination(config: TestConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let credentials = Credentials::new(
-            &config.dst_access_key,
-            &config.dst_secret_key,
+        // Use the same approach as the main migration tool's RadosGW client
+        use aws_config::{
+            retry::RetryConfig, retry::RetryMode, timeout::TimeoutConfig, BehaviorVersion,
+            SdkConfig,
+        };
+        use aws_sdk_s3::config::retry::RetryConfigBuilder;
+
+        let creds = Credentials::from_keys(
+            config.dst_access_key.clone(),
+            config.dst_secret_key.clone(),
             None,
-            None,
-            "test",
         );
-
-        let s3_config = Config::builder()
-            .credentials_provider(credentials)
-            .endpoint_url(&config.dst_endpoint)
-            .region(aws_sdk_s3::config::Region::new("us-east-1".to_string())) // Default region for Cellar
-            .behavior_version(BehaviorVersion::latest())
-            .force_path_style(config.dst_path_style)
-            // Configure timeouts to handle stale connections
-            .timeout_config(
-                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-                    .operation_timeout(Duration::from_secs(60))
-                    .operation_attempt_timeout(Duration::from_secs(30))
-                    .build(),
-            )
+        let timeout_config = TimeoutConfig::builder()
+            .operation_timeout(std::time::Duration::from_secs(30))
+            .operation_attempt_timeout(std::time::Duration::from_secs(600))
+            .connect_timeout(std::time::Duration::from_secs(3))
             .build();
+        let retry_config = RetryConfigBuilder::new()
+            .mode(RetryMode::Standard)
+            .max_attempts(5)
+            .build();
+        let mut sdk_config = SdkConfig::builder()
+            .retry_config(retry_config)
+            .timeout_config(timeout_config);
 
+        let region = aws_sdk_s3::config::Region::new("us-east-1".to_string()); // Default region for Cellar
+        sdk_config
+            .set_region(region)
+            .set_endpoint_url(Some(config.dst_endpoint.clone()));
+
+        let sdk_config = sdk_config.build();
+        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .credentials_provider(creds)
+            .behavior_version(BehaviorVersion::v2023_11_09())
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .force_path_style(true)
+            .build();
         let client = Client::from_conf(s3_config);
 
         Ok(Self { client })
@@ -175,14 +208,20 @@ impl S3TestClient {
                 );
             }
 
-            let body = ByteStream::from_path(file_path).await?;
+            // Read file content to calculate MD5 for compatibility with older S3 implementations
+            let file_content = std::fs::read(file_path)?;
+            let md5_hash = md5::compute(&file_content);
+            let content_md5 = base64::engine::general_purpose::STANDARD.encode(md5_hash.as_ref());
+
+            let body = ByteStream::from(file_content);
 
             let mut put_request = self
                 .client
                 .put_object()
                 .bucket(bucket_name)
                 .key(test_file.key())
-                .body(body);
+                .body(body)
+                .content_md5(&content_md5); // Set Content-MD5 explicitly for compatibility
 
             // Add metadata if present
             if let Some(content_type) = &test_file.content_type {
@@ -220,6 +259,9 @@ impl S3TestClient {
             if test_file.acl_public {
                 put_request = put_request.acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead);
             }
+
+            // Try setting Content-MD5 manually to avoid newer checksum algorithms
+            // that might not be supported by older S3-compatible services
 
             match put_request.send().await {
                 Ok(_) => {
@@ -478,9 +520,7 @@ impl S3TestClient {
                         let backoff = INITIAL_BACKOFF_MS * (1 << (attempt - 1));
                         println!(
                             "⚠ list_objects_v2 attempt {} failed ({}); retrying in {} ms",
-                            attempt,
-                            err,
-                            backoff
+                            attempt, err, backoff
                         );
                         sleep(Duration::from_millis(backoff)).await;
                     }

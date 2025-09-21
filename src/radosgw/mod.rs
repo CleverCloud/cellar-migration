@@ -1,23 +1,40 @@
 pub mod uploader;
 
-use std::{
-    pin::Pin,
-    fmt::Debug,
-};
+use std::{fmt::Debug, pin::Pin};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use aws_config::{SdkConfig, timeout::TimeoutConfig, retry::{RetryConfigBuilder, RetryMode}, BehaviorVersion, Region};
+use aws_config::{
+    retry::{RetryConfigBuilder, RetryMode},
+    timeout::TimeoutConfig,
+    BehaviorVersion, Region, SdkConfig,
+};
 use aws_credential_types::Credentials;
-use aws_sdk_s3::{primitives::ByteStream, operation::{put_object::{PutObjectOutput, PutObjectError}, create_multipart_upload::{CreateMultipartUploadOutput, CreateMultipartUploadError}, upload_part::{UploadPartOutput, UploadPartError}, complete_multipart_upload::{CompleteMultipartUploadOutput, CompleteMultipartUploadError}, abort_multipart_upload::{AbortMultipartUploadOutput, AbortMultipartUploadError}, delete_object::DeleteObjectError, create_bucket::CreateBucketError, head_object::HeadObjectOutput, get_object::{GetObjectOutput, GetObjectError}}, error::SdkError, types::{CompletedMultipartUpload, CompletedPart, Bucket}};
+use aws_sdk_s3::{
+    error::SdkError,
+    operation::{
+        abort_multipart_upload::{AbortMultipartUploadError, AbortMultipartUploadOutput},
+        complete_multipart_upload::{CompleteMultipartUploadError, CompleteMultipartUploadOutput},
+        create_bucket::CreateBucketError,
+        create_multipart_upload::{CreateMultipartUploadError, CreateMultipartUploadOutput},
+        delete_object::DeleteObjectError,
+        get_object::{GetObjectError, GetObjectOutput},
+        head_object::HeadObjectOutput,
+        put_object::{PutObjectError, PutObjectOutput},
+        upload_part::{UploadPartError, UploadPartOutput},
+    },
+    primitives::ByteStream,
+    types::{Bucket, CompletedMultipartUpload, CompletedPart},
+};
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_types_convert::date_time::DateTimeExt;
 use bytes::Bytes;
 use futures::Stream;
-use tracing::{event, instrument, Level, error, debug};
+use tracing::{debug, error, event, instrument, Level};
 
 use crate::provider::{
-    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse, ProviderResponseStreamChunk, ProviderResponseStream,
+    Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse, ProviderResponseStream,
+    ProviderResponseStreamChunk,
 };
 
 type S3Client = aws_sdk_s3::Client;
@@ -50,12 +67,17 @@ impl RadosGW {
     ) -> RadosGW {
         RadosGW {
             bucket,
-            client: RadosGW::get_client(access_key, secret_key, endpoint, region)
+            client: RadosGW::get_client(access_key, secret_key, endpoint, region),
         }
     }
 
     #[instrument(level = "trace")]
-    fn get_client(access_key: String, secret_key: String, endpoint: Option<String>, region: Option<String>) -> S3Client {
+    fn get_client(
+        access_key: String,
+        secret_key: String,
+        endpoint: Option<String>,
+        region: Option<String>,
+    ) -> S3Client {
         let creds = Credentials::from_keys(access_key, secret_key, None);
         let timeout_config = TimeoutConfig::builder()
             .operation_timeout(std::time::Duration::from_secs(30))
@@ -79,11 +101,11 @@ impl RadosGW {
                 sdk_config
                     .set_region(region)
                     .set_endpoint_url(Some(endpoint.clone()));
-            },
+            }
             (Some(endpoint), None) => {
                 sdk_config.set_endpoint_url(Some(endpoint.clone()));
                 sdk_config.set_region(Some(Region::from_static("eu-west-1")));
-            },
+            }
             (None, Some(region)) => {
                 let region = aws_sdk_s3::config::Region::new(region.clone());
                 sdk_config.set_region(region);
@@ -98,6 +120,9 @@ impl RadosGW {
         let config = aws_sdk_s3::config::Builder::from(&sdk_config)
             .credentials_provider(creds)
             .behavior_version(BehaviorVersion::v2023_11_09())
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
             .force_path_style(true) // TODO: make it configurable
             .build();
         S3Client::from_conf(config)
@@ -111,19 +136,32 @@ impl RadosGW {
         size: i64,
         body: ByteStream,
     ) -> Result<PutObjectOutput, SdkError<PutObjectError, HttpResponse>> {
-        self.client.put_object()
+        self.client
+            .put_object()
             .body(body)
             .key(key)
-            .bucket(self.bucket.clone().expect("put_object should have a bucket"))
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("put_object should have a bucket"),
+            )
             .content_length(size)
-            .set_acl(if object_metadata.acl_public { Some(aws_sdk_s3::types::ObjectCannedAcl::PublicRead) } else { None })
+            .set_acl(if object_metadata.acl_public {
+                Some(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+            } else {
+                None
+            })
             .set_cache_control(object_metadata.cache_control.clone())
             .set_content_disposition(object_metadata.content_disposition.clone())
             .set_content_encoding(object_metadata.content_encoding.clone())
             .set_content_language(object_metadata.content_language.clone())
             .set_content_md5(object_metadata.content_md5.clone())
             .set_content_type(object_metadata.content_type.clone())
-            .set_expires(object_metadata.expires.map(aws_smithy_types::date_time::DateTime::from_chrono_utc))
+            .set_expires(
+                object_metadata
+                    .expires
+                    .map(aws_smithy_types::date_time::DateTime::from_chrono_utc),
+            )
             .send()
             .await
     }
@@ -133,21 +171,33 @@ impl RadosGW {
         &self,
         key: String,
         object_metadata: &ProviderObjectMetadata,
-    ) -> Result<CreateMultipartUploadOutput, SdkError<CreateMultipartUploadError, HttpResponse>> {
+    ) -> Result<CreateMultipartUploadOutput, SdkError<CreateMultipartUploadError, HttpResponse>>
+    {
         self.client
             .create_multipart_upload()
             .key(key)
-            .bucket(self.bucket.clone().expect("create_multipart_upload should have a bucket"))
-            .set_acl(if object_metadata.acl_public { Some(aws_sdk_s3::types::ObjectCannedAcl::PublicRead) } else { None })
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("create_multipart_upload should have a bucket"),
+            )
+            .set_acl(if object_metadata.acl_public {
+                Some(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+            } else {
+                None
+            })
             .set_cache_control(object_metadata.cache_control.clone())
             .set_content_disposition(object_metadata.content_disposition.clone())
             .set_content_encoding(object_metadata.content_encoding.clone())
             .set_content_language(object_metadata.content_language.clone())
             .set_content_type(object_metadata.content_type.clone())
-            .set_expires(object_metadata.expires.map(aws_smithy_types::date_time::DateTime::from_chrono_utc))
+            .set_expires(
+                object_metadata
+                    .expires
+                    .map(aws_smithy_types::date_time::DateTime::from_chrono_utc),
+            )
             .send()
             .await
-
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -159,15 +209,20 @@ impl RadosGW {
         upload_id: String,
         part_number: i32,
     ) -> Result<UploadPartOutput, SdkError<UploadPartError, HttpResponse>> {
-        self.client.upload_part()
-        .key(key)
-        .bucket(self.bucket.clone().expect("put_object_part should have a bucket"))
-        .body(body)
-        .upload_id(upload_id)
-        .part_number(part_number)
-        .content_length(size)
-        .send()
-        .await
+        self.client
+            .upload_part()
+            .key(key)
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("put_object_part should have a bucket"),
+            )
+            .body(body)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .content_length(size)
+            .send()
+            .await
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -176,7 +231,8 @@ impl RadosGW {
         key: String,
         upload_id: String,
         parts: Vec<(usize, UploadPartOutput)>,
-    ) -> Result<CompleteMultipartUploadOutput, SdkError<CompleteMultipartUploadError, HttpResponse>> {
+    ) -> Result<CompleteMultipartUploadOutput, SdkError<CompleteMultipartUploadError, HttpResponse>>
+    {
         let parts = parts
             .iter()
             .map(|(part_number, part)| {
@@ -194,7 +250,11 @@ impl RadosGW {
         self.client
             .complete_multipart_upload()
             .key(key)
-            .bucket(self.bucket.clone().expect("complete_multipart_upload should have a bucket"))
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("complete_multipart_upload should have a bucket"),
+            )
             .multipart_upload(completed_multipart_upload_parts)
             .upload_id(upload_id)
             .send()
@@ -210,7 +270,11 @@ impl RadosGW {
         self.client
             .abort_multipart_upload()
             .key(key)
-            .bucket(self.bucket.clone().expect("abort_multipart_upload should have a bucket"))
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("abort_multipart_upload should have a bucket"),
+            )
             .upload_id(upload_id)
             .send()
             .await
@@ -225,12 +289,19 @@ impl RadosGW {
         event!(
             Level::TRACE,
             "Sending ListObjectV2Request: bucket={:?}, start_after={:?}, max_keys={:?}",
-            self.bucket, start_after, max_results
+            self.bucket,
+            start_after,
+            max_results
         );
 
-        let objects = self.client
+        let objects = self
+            .client
             .list_objects_v2()
-            .bucket(self.bucket.clone().expect("list_objects should have a bucket"))
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("list_objects should have a bucket"),
+            )
             .set_start_after(start_after.clone())
             .set_max_keys(max_results)
             .send()
@@ -257,7 +328,11 @@ impl RadosGW {
     ) -> Result<ProviderObject, SdkError<DeleteObjectError, HttpResponse>> {
         self.client
             .delete_object()
-            .bucket(self.bucket.clone().expect("delete_object should have a bucket"))
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("delete_object should have a bucket"),
+            )
             .key(object.get_key())
             .send()
             .await
@@ -295,7 +370,11 @@ impl RadosGW {
     ) -> anyhow::Result<HeadObjectOutput> {
         self.client
             .head_object()
-            .bucket(self.bucket.clone().expect("get_object_metadata should have a bucket"))
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("get_object_metadata should have a bucket"),
+            )
             .key(object.get_key())
             .send()
             .await
@@ -312,7 +391,11 @@ impl RadosGW {
     pub async fn get_object(&self, object: &ProviderObject) -> anyhow::Result<GetObjectOutput> {
         self.client
             .get_object()
-            .bucket(self.bucket.clone().expect("get_object should have a bucket"))
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("get_object should have a bucket"),
+            )
             .key(object.get_key())
             .send()
             .await
@@ -337,7 +420,8 @@ impl Stream for RadosGWResponseInner {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        Pin::new(&mut self.output.body).poll_next(cx)
+        Pin::new(&mut self.output.body)
+            .poll_next(cx)
             .map_err(Into::into)
     }
 }
@@ -374,12 +458,12 @@ impl ProviderResponse for RadosGWResponse {
                             error!("Unknown GetObjectError {:?}", e);
                             500
                         }
-                    }
+                    },
                     e => {
                         error!("Unknown S3 error: {:?} on GetObjectError", e);
                         500
                     }
-                }
+                },
                 None => {
                     // Usually, network errors or stuff like that
                     error!("Failed to downcast to a GetObjectError: {:?}", err);
@@ -389,10 +473,7 @@ impl ProviderResponse for RadosGWResponse {
         }
     }
 
-    fn body(
-        &mut self,
-    ) -> ProviderResponseStream
-    {
+    fn body(&mut self) -> ProviderResponseStream {
         match &self.error {
             None => {
                 let response = self.response.take().expect("We should have a response");
@@ -403,11 +484,7 @@ impl ProviderResponse for RadosGWResponse {
         }
     }
 
-    fn body_chunked(
-        &mut self,
-        chunk_size: usize,
-    ) -> ProviderResponseStream
-    {
+    fn body_chunked(&mut self, chunk_size: usize) -> ProviderResponseStream {
         match &self.error {
             None => {
                 let response = self.response.take().expect("We should have a response");

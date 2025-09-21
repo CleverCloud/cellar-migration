@@ -2,6 +2,16 @@ use crate::config::TestConfig;
 use std::io::{self, Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
 
+/// Get the path to a built binary, avoiding recompilation
+pub fn get_binary_path(binary_name: &str) -> Result<String, std::env::VarError> {
+    let env_var = format!("CARGO_BIN_EXE_{}", binary_name.replace('-', "_"));
+    std::env::var(&env_var).or_else(|_| -> Result<String, std::env::VarError> {
+        // Fallback: look in target/debug
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
+        Ok(format!("{}/target/debug/{}", manifest_dir, binary_name))
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct MigrationOptions {
     pub chunk_size_mb: usize,
@@ -55,13 +65,13 @@ pub async fn run_migration_cli(
     dst_bucket: &str,
     options: MigrationOptions,
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("cargo");
+    // Use the already-built binary instead of cargo run to avoid recompilation
+    let binary_path = get_binary_path("cellar-migration")
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    let mut cmd = Command::new(&binary_path);
 
     let mut args = vec![
-        "run".to_string(),
-        "--bin".to_string(),
-        "cellar-migration".to_string(),
-        "--".to_string(),
         "migrate".to_string(),
         "--source-access-key".to_string(),
         config.src_access_key.clone(),
@@ -106,7 +116,7 @@ pub async fn run_migration_cli(
     let nocapture_enabled = is_nocapture_enabled();
 
     if nocapture_enabled {
-        println!("launching cli: cargo {}", args.join(" "));
+        println!("launching cli: {} {}", binary_path, args.join(" "));
 
         let mut child = cmd.spawn()?;
         let mut child_stdout = child.stdout.take().ok_or_else(|| {

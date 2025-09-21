@@ -1,7 +1,15 @@
-use std::{cmp::Ordering, error, collections::VecDeque, sync::{Arc, Mutex}};
+use std::{
+    cmp::Ordering,
+    collections::VecDeque,
+    error,
+    sync::{Arc, Mutex},
+};
 
-use aws_sdk_s3::{error::SdkError, operation::{list_objects_v2::ListObjectsV2Error, create_bucket::CreateBucketError}};
-use aws_smithy_runtime_api::client::{orchestrator::HttpResponse};
+use aws_sdk_s3::{
+    error::SdkError,
+    operation::{create_bucket::CreateBucketError, list_objects_v2::ListObjectsV2Error},
+};
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use bytesize::ByteSize;
 use futures::StreamExt;
 
@@ -10,7 +18,7 @@ use tokio::task::JoinError;
 use tracing::{event, instrument, Level};
 
 use crate::{
-    provider::{get_provider, ProviderConf, ProviderObject, Providers, Provider},
+    provider::{get_provider, Provider, ProviderConf, ProviderObject, Providers},
     radosgw::{
         uploader::{ThreadMigrationResult, Uploader},
         RadosGW,
@@ -546,20 +554,22 @@ pub async fn create_destination_buckets(
 
             match client_dry_run.list_objects(Some(1), None).next().await {
                 Some(Ok(_)) | None => {}
-                Some(Err(error)) => match error.downcast::<SdkError<ListObjectsV2Error,HttpResponse>>() {
-                    Ok(downcast_error) => match downcast_error.into_service_error() {
-                        ListObjectsV2Error::NoSuchBucket(_) => {
-                            event!(Level::INFO, "DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
+                Some(Err(error)) => {
+                    match error.downcast::<SdkError<ListObjectsV2Error, HttpResponse>>() {
+                        Ok(downcast_error) => match downcast_error.into_service_error() {
+                            ListObjectsV2Error::NoSuchBucket(_) => {
+                                event!(Level::INFO, "DRY-RUN | Bucket {} is missing on the destination add-on. In non dry-run mode, I would create it.", destination_bucket);
+                            }
+                            e => {
+                                bucket_already_created(&destination_bucket);
+                                return Err(anyhow::Error::from(e));
+                            }
                         },
-                        e => {
-                            bucket_already_created(&destination_bucket);
-                            return Err(anyhow::Error::from(e));
+                        Err(downcast) => {
+                            panic!("Failed to downcast error to a RusotoError: {:?}", downcast)
                         }
                     }
-                    Err(downcast) => {
-                        panic!("Failed to downcast error to a RusotoError: {:?}", downcast)
-                    }
-                },
+                }
             };
         } else {
             event!(
@@ -576,21 +586,19 @@ pub async fn create_destination_buckets(
                         destination_bucket
                     )
                 }
-                Err(error) => {
-                    match error.into_service_error() {
-                        CreateBucketError::BucketAlreadyOwnedByYou(_) => {
-                            event!(
-                                Level::INFO,
-                                "Bucket {} | Bucket created",
-                                destination_bucket
-                            )
-                        },
-                        e => {
-                            bucket_already_created(&destination_bucket);
-                            return Err(anyhow::Error::from(e));
-                        }
+                Err(error) => match error.into_service_error() {
+                    CreateBucketError::BucketAlreadyOwnedByYou(_) => {
+                        event!(
+                            Level::INFO,
+                            "Bucket {} | Bucket created",
+                            destination_bucket
+                        )
                     }
-                }
+                    e => {
+                        bucket_already_created(&destination_bucket);
+                        return Err(anyhow::Error::from(e));
+                    }
+                },
             };
         }
     }

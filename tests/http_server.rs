@@ -1,7 +1,11 @@
-use hyper::{body::to_bytes, Client, Uri};
+use bytes;
+use http_body_util::{BodyExt, Empty};
+use hyper::Uri;
+use hyper_util::client::legacy::Client;
 use std::error::Error;
 use std::net::TcpListener;
 use std::process::Stdio;
+use test_common::get_binary_path;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
@@ -14,8 +18,10 @@ async fn test_http_server_responds() -> TestResult {
     let port = listener.local_addr()?.port();
     drop(listener);
 
-    let mut child = Command::new("cargo")
-        .args(["run", "--bin", "http-server"])
+    let binary_path =
+        get_binary_path("http-server").map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+
+    let mut child = Command::new(&binary_path)
         .env("PORT", port.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -23,7 +29,8 @@ async fn test_http_server_responds() -> TestResult {
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
     // Give the server a moment to bind; retry the health-check a few times to avoid flakes.
-    let client = Client::new();
+    let client =
+        Client::builder(hyper_util::rt::TokioExecutor::new()).build_http::<Empty<bytes::Bytes>>();
     let uri: Uri = format!("http://127.0.0.1:{}/", port)
         .parse()
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
@@ -45,7 +52,7 @@ async fn test_http_server_responds() -> TestResult {
     };
 
     assert_eq!(response.status(), 200);
-    let body = to_bytes(response.into_body()).await?;
+    let body = response.into_body().collect().await?.to_bytes();
     assert_eq!(&body[..], b"Clever Cloud S3 Migration Tool");
 
     // Shut the server down to keep the test suite tidy.

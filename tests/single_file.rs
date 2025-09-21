@@ -254,12 +254,9 @@ async fn test_preserves_content_disposition() -> Result<(), Box<dyn std::error::
     let test_name = "metadata-content-disposition";
     let file_generator = FileGenerator::new_for_test(test_name)?;
 
-    run_single_file_metadata_case(
-        &config,
-        &file_generator,
-        test_name,
-        |file| file.with_content_disposition("attachment; filename=\"data.txt\""),
-    )
+    run_single_file_metadata_case(&config, &file_generator, test_name, |file| {
+        file.with_content_disposition("attachment; filename=\"data.txt\"")
+    })
     .await?;
 
     file_generator.cleanup()?;
@@ -280,12 +277,9 @@ async fn test_preserves_content_encoding() -> Result<(), Box<dyn std::error::Err
     let test_name = "metadata-content-encoding";
     let file_generator = FileGenerator::new_for_test(test_name)?;
 
-    run_single_file_metadata_case(
-        &config,
-        &file_generator,
-        test_name,
-        |file| file.with_content_encoding("gzip"),
-    )
+    run_single_file_metadata_case(&config, &file_generator, test_name, |file| {
+        file.with_content_encoding("gzip")
+    })
     .await?;
 
     file_generator.cleanup()?;
@@ -306,12 +300,9 @@ async fn test_preserves_content_language() -> Result<(), Box<dyn std::error::Err
     let test_name = "metadata-content-language";
     let file_generator = FileGenerator::new_for_test(test_name)?;
 
-    run_single_file_metadata_case(
-        &config,
-        &file_generator,
-        test_name,
-        |file| file.with_content_language("fr-FR"),
-    )
+    run_single_file_metadata_case(&config, &file_generator, test_name, |file| {
+        file.with_content_language("fr-FR")
+    })
     .await?;
 
     file_generator.cleanup()?;

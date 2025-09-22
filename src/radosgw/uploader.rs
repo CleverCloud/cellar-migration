@@ -204,10 +204,8 @@ impl Uploader {
 
             if object_size < multipart_chunk_size {
                 // Create ByteStream from the response body with known size to avoid UnsizedRequestBody errors
-                let body_http04x = ProviderResponseHttp04X::with_exact_size(
-                    response.body(),
-                    object_size,
-                );
+                let body_http04x =
+                    ProviderResponseHttp04X::with_exact_size(response.body(), object_size);
                 let body = ByteStream::from_body_1_x(body_http04x);
 
                 Uploader::sync_object_singlepart(
@@ -454,35 +452,3 @@ impl std::fmt::Display for DownloadError {
     }
 }
 
-pub struct RiakResponseStream {
-    body: Incoming,
-}
-
-impl RiakResponseStream {
-    pub fn new(body: Incoming) -> RiakResponseStream {
-        RiakResponseStream { body }
-    }
-}
-
-impl Stream for RiakResponseStream {
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match Pin::new(&mut self.body).poll_frame(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                    Ok(body) => return Poll::Ready(Some(Ok(body))),
-                    Err(_) => continue,
-                },
-                Poll::Ready(Some(Err(error))) => {
-                    return Poll::Ready(Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        error,
-                    ))))
-                }
-            }
-        }
-    }
-}

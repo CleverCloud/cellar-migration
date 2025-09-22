@@ -1,7 +1,6 @@
 mod migrate;
 mod provider;
 mod radosgw;
-mod riakcs;
 
 use bytesize::ByteSize;
 use clap::{value_parser, ArgAction};
@@ -39,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
             .arg(Arg::new("source-access-key").long("source-access-key").help("Source bucket Cellar access key").required(true))
             .arg(Arg::new("source-secret-key").long("source-secret-key").help("Source bucket Cellar secret key").required(true))
             .arg(Arg::new("source-endpoint").long("source-endpoint").help("Source endpoint of the S3 Bucket").value_parser(value_parser!(Url)))
-            .arg(Arg::new("source-provider").long("source-provider").help("Provider for source bucket (AWS, Ceph, RiakCS, ..)").required(true))
+            .arg(Arg::new("source-provider").long("source-provider").help("Provider for source bucket (aws-s3 or cellar)").required(true))
             .arg(Arg::new("source-region").long("source-region").help("Region of the source bucket (eu-west-1,..)"))
             .arg(Arg::new("destination-bucket").long("destination-bucket").help("Destination bucket to which the files will be copied. If omitted, the bucket will be created if it doesn't exist"))
             .arg(Arg::new("destination-bucket-prefix").long("destination-bucket-prefix").help("Prefix to apply to the destination bucket name"))

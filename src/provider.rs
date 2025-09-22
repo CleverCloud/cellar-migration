@@ -16,13 +16,7 @@ use futures::{Stream, StreamExt};
 use http_body::Frame;
 use tracing::{error, event, instrument, Level};
 
-use crate::{
-    radosgw::RadosGW,
-    riakcs::{
-        dto::{ObjectContents, ObjectMetadataResponse},
-        RiakCS,
-    },
-};
+use crate::radosgw::RadosGW;
 
 pub struct ProviderConf {
     pub endpoint: Option<String>,
@@ -73,17 +67,6 @@ impl ProviderObject {
 
     pub fn get_size(&self) -> u64 {
         self.size
-    }
-}
-
-impl From<&ObjectContents> for ProviderObject {
-    fn from(value: &ObjectContents) -> Self {
-        ProviderObject {
-            key: value.get_key(),
-            etag: value.get_etag(),
-            last_modified: value.get_last_modified(),
-            size: value.get_size(),
-        }
     }
 }
 
@@ -146,25 +129,6 @@ pub struct ProviderObjectMetadata {
     pub expires: Option<DateTime<Utc>>,
 }
 
-impl From<ObjectMetadataResponse> for ProviderObjectMetadata {
-    fn from(value: ObjectMetadataResponse) -> Self {
-        let m = value.metadata;
-        ProviderObjectMetadata {
-            acl_public: value.acl_public,
-            last_modified: m.last_modified,
-            etag: m.etag.clone(),
-            content_type: m.content_type.clone(),
-            content_length: m.content_length,
-            cache_control: m.cache_control.clone(),
-            content_disposition: m.content_disposition.clone(),
-            content_encoding: m.content_encoding.clone(),
-            content_language: m.content_language.clone(),
-            content_md5: m.content_md5.clone(),
-            expires: m.expires,
-        }
-    }
-}
-
 impl From<aws_sdk_s3::operation::head_object::HeadObjectOutput> for ProviderObjectMetadata {
     fn from(value: aws_sdk_s3::operation::head_object::HeadObjectOutput) -> Self {
         let expires = value.expires_string().and_then(|s| {
@@ -185,9 +149,9 @@ impl From<aws_sdk_s3::operation::head_object::HeadObjectOutput> for ProviderObje
             if etag.starts_with('"') && etag.ends_with('"') && !etag.contains('-') {
                 let hex_md5 = etag.trim_matches('"');
                 // Convert hex to bytes, then to base64
-                hex::decode(hex_md5).ok().map(|bytes| {
-                    base64::engine::general_purpose::STANDARD.encode(&bytes)
-                })
+                hex::decode(hex_md5)
+                    .ok()
+                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(&bytes))
             } else {
                 None
             }
@@ -222,7 +186,7 @@ pub(crate) type ProviderResponseStream =
     Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + Sync>>;
 pub(crate) type ProviderResponseStreamInner = Arc<Mutex<ProviderResponseStream>>;
 
-/// This struct exists so we can share a single RiakResponseStreamChunk
+/// This struct exists so we can share a single ProviderResponseStreamChunk
 /// that will be fed to multiple ByteStream instances, without losing the
 /// ownership on the inner Stream.
 pub struct ProviderResponseStreamChunkWrapper {
@@ -357,7 +321,6 @@ dyn_clone::clone_trait_object!(Provider);
 
 #[derive(Debug, Clone)]
 pub enum Providers {
-    RiakCS,
     Cellar,
     AwsS3,
 }
@@ -366,7 +329,6 @@ impl TryFrom<&str> for Providers {
     type Error = String;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
-            "riak-cs" => Ok(Providers::RiakCS),
             "cellar" => Ok(Providers::Cellar),
             "aws-s3" => Ok(Providers::AwsS3),
             _ => Err(format!("Failed to parse provider name: {}", value)),
@@ -376,13 +338,6 @@ impl TryFrom<&str> for Providers {
 
 pub fn get_provider(provider: &Providers, conf: ProviderConf) -> Box<dyn Provider> {
     match provider {
-        Providers::RiakCS => Box::new(RiakCS::new(
-            conf.endpoint
-                .expect("RiakCS requires an endpoint and not a region"),
-            conf.access_key,
-            conf.secret_key,
-            conf.bucket,
-        )),
         Providers::Cellar => Box::new(RadosGW::new(
             conf.endpoint,
             None,
@@ -409,7 +364,7 @@ pub enum ProviderResponseStreamChunkState {
 
 /// This structure exists because when we give a part to upload to rusoto
 /// it will read until the end of the stream to end the part instead of just reading what the part's size
-/// This structure simulates that, encapsulates the RiakResponseStream and keep an internal state on when to end the stream
+/// This structure simulates that, encapsulates the ProviderResponseStream and keep an internal state on when to end the stream
 /// because a part has been fully read.
 pub struct ProviderResponseStreamChunk {
     response: ProviderResponseStream,

@@ -515,9 +515,9 @@ pub async fn create_destination_buckets(
 
         buckets
             .iter()
-            .filter(|riakcs_bucket| {
-                let riakcs_bucket_name =
-                    format!("{}{}", destination_bucket_prefix, **riakcs_bucket);
+            .filter(|source_bucket| {
+                let source_bucket_name =
+                    format!("{}{}", destination_bucket_prefix, **source_bucket);
 
                 !radosgw_buckets.iter().any(|radosgw_bucket| -> bool {
                     let radosgw_bucket_name = radosgw_bucket
@@ -525,7 +525,7 @@ pub async fn create_destination_buckets(
                         .as_ref()
                         .expect("RadosGW bucket should have a name");
 
-                    riakcs_bucket_name == *radosgw_bucket_name
+                    source_bucket_name == *radosgw_bucket_name
                 })
             })
             .collect::<Vec<&String>>()

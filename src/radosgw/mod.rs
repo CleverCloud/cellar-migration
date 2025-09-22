@@ -98,6 +98,7 @@ impl RadosGW {
         let config = aws_sdk_s3::config::Builder::from(&sdk_config)
             .credentials_provider(creds)
             .behavior_version(BehaviorVersion::v2023_11_09())
+            .force_path_style(true) // TODO: make it configurable
             .build();
         S3Client::from_conf(config)
     }

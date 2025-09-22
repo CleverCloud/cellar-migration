@@ -46,3 +46,8 @@ bytesize = "1.1"
 dyn-clone = "1.0.10"
 libc = "0.2"
 url = "2.5"
+
+[dev-dependencies]
+md5 = "0.7"
+rand = "0.8"
+test-common = { path = "tests/test-common" }

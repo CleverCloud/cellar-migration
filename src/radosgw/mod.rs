@@ -19,12 +19,13 @@ use aws_sdk_s3::{
         create_multipart_upload::{CreateMultipartUploadError, CreateMultipartUploadOutput},
         delete_object::DeleteObjectError,
         get_object::{GetObjectError, GetObjectOutput},
+        get_object_acl::{GetObjectAclError, GetObjectAclOutput},
         head_object::HeadObjectOutput,
         put_object::{PutObjectError, PutObjectOutput},
         upload_part::{UploadPartError, UploadPartOutput},
     },
     primitives::ByteStream,
-    types::{Bucket, CompletedMultipartUpload, CompletedPart},
+    types::{Bucket, CompletedMultipartUpload, CompletedPart, Permission},
 };
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_types_convert::date_time::DateTimeExt;
@@ -364,7 +365,7 @@ impl RadosGW {
             .map(|_| ())
     }
     #[instrument(skip(self), level = "debug")]
-    pub async fn get_object_metadata(
+    pub async fn head_object_metadata(
         &self,
         object: &ProviderObject,
     ) -> anyhow::Result<HeadObjectOutput> {
@@ -373,7 +374,7 @@ impl RadosGW {
             .bucket(
                 self.bucket
                     .clone()
-                    .expect("get_object_metadata should have a bucket"),
+                    .expect("head_object_metadata should have a bucket"),
             )
             .key(object.get_key())
             .send()
@@ -385,6 +386,23 @@ impl RadosGW {
                     error
                 )
             })
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_object_acl(
+        &self,
+        object: &ProviderObject,
+    ) -> Result<GetObjectAclOutput, SdkError<GetObjectAclError, HttpResponse>> {
+        self.client
+            .get_object_acl()
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("get_object_acl should have a bucket"),
+            )
+            .key(object.get_key())
+            .send()
+            .await
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -568,9 +586,29 @@ impl Provider for RadosGW {
         &self,
         object: &ProviderObject,
     ) -> anyhow::Result<ProviderObjectMetadata> {
-        self.get_object_metadata(object)
-            .await
-            .map(|response| response.into())
+        let (head_result, acl_result) = tokio::join!(
+            self.head_object_metadata(object),
+            self.get_object_acl(object)
+        );
+
+        let mut metadata: ProviderObjectMetadata = head_result?.into();
+
+        match acl_result {
+            Ok(acl) => {
+                metadata.acl_public = acl_has_public_read(&acl);
+            }
+            Err(error) => {
+                event!(
+                    Level::WARN,
+                    "Failed to fetch ACL for object {}: {:?}. Defaulting to private ACL.",
+                    object.get_key(),
+                    error
+                );
+                metadata.acl_public = false;
+            }
+        }
+
+        Ok(metadata)
     }
     async fn get_object(
         &self,
@@ -581,4 +619,23 @@ impl Provider for RadosGW {
         let x: Box<dyn ProviderResponse> = Box::new(RadosGWResponse::new(object));
         Ok(x)
     }
+}
+
+fn acl_has_public_read(acl: &GetObjectAclOutput) -> bool {
+    acl.grants().iter().any(|grant| {
+        let is_public_group = grant
+            .grantee()
+            .and_then(|grantee| grantee.uri())
+            .map(|uri| uri == "http://acs.amazonaws.com/groups/global/AllUsers")
+            .unwrap_or(false);
+
+        if !is_public_group {
+            return false;
+        }
+
+        matches!(
+            grant.permission(),
+            Some(Permission::Read) | Some(Permission::FullControl)
+        )
+    })
 }

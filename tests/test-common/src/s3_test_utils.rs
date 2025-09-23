@@ -736,9 +736,7 @@ impl S3TestClient {
             if attempt > 1 {
                 println!(
                     "Retrying versioned upload for {} (attempt {}/{})",
-                    object_key,
-                    attempt,
-                    MAX_ATTEMPTS
+                    object_key, attempt, MAX_ATTEMPTS
                 );
             }
 
@@ -762,8 +760,7 @@ impl S3TestClient {
                     if attempt > 1 {
                         println!(
                             "Versioned upload succeeded for {} after {} attempts",
-                            object_key,
-                            attempt
+                            object_key, attempt
                         );
                     }
 
@@ -858,10 +855,7 @@ impl S3TestClient {
                     if attempt == MAX_ATTEMPTS || !retryable {
                         return Err(format!(
                             "PutObject versioned {} -> {} failed after {} attempts: {}",
-                            object_key,
-                            bucket_name,
-                            attempt,
-                            detail
+                            object_key, bucket_name, attempt, detail
                         )
                         .into());
                     }
@@ -869,10 +863,7 @@ impl S3TestClient {
                     let backoff_ms = INITIAL_BACKOFF_MS * (1u64 << (attempt - 1));
                     println!(
                         "Versioned upload attempt {} for {} failed: {}; retrying in {} ms",
-                        attempt,
-                        object_key,
-                        detail,
-                        backoff_ms
+                        attempt, object_key, detail, backoff_ms
                     );
                     sleep(Duration::from_millis(backoff_ms)).await;
                 }
@@ -968,14 +959,21 @@ impl TestBucketManager {
 
         // Enable versioning on source bucket
         println!("[{}] Enabling versioning on source bucket", test_name);
-        self.source_client.enable_bucket_versioning(&src_bucket).await?;
+        self.source_client
+            .enable_bucket_versioning(&src_bucket)
+            .await?;
 
         // Enable versioning on destination bucket
         println!("[{}] Enabling versioning on destination bucket", test_name);
-        self.dest_client.enable_bucket_versioning(&dst_bucket).await?;
+        self.dest_client
+            .enable_bucket_versioning(&dst_bucket)
+            .await?;
 
         // Verify versioning is enabled
-        let src_versioning = self.source_client.get_bucket_versioning(&src_bucket).await?;
+        let src_versioning = self
+            .source_client
+            .get_bucket_versioning(&src_bucket)
+            .await?;
         let dst_versioning = self.dest_client.get_bucket_versioning(&dst_bucket).await?;
 
         if src_versioning != aws_sdk_s3::types::BucketVersioningStatus::Enabled {

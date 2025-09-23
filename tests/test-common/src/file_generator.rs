@@ -177,7 +177,7 @@ impl FileGenerator {
     pub fn generate_file_with_content(
         &self,
         test_file: &TestFile,
-        content: &[u8]
+        content: &[u8],
     ) -> Result<PathBuf, std::io::Error> {
         let file_path = self.temp_dir.join(&test_file.path);
 

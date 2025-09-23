@@ -465,14 +465,18 @@ impl MigrationVerifier {
         println!("Verifying versioned migration for object: {}", object_key);
 
         // Get all versions from source bucket
-        let src_versions = source_client.list_object_versions(src_bucket, Some(object_key)).await?;
+        let src_versions = source_client
+            .list_object_versions(src_bucket, Some(object_key))
+            .await?;
         let src_versions_for_key: Vec<_> = src_versions
             .iter()
             .filter(|v| v.key().map_or(false, |k| k == object_key))
             .collect();
 
         // Get all versions from destination bucket
-        let dst_versions = dest_client.list_object_versions(dst_bucket, Some(object_key)).await?;
+        let dst_versions = dest_client
+            .list_object_versions(dst_bucket, Some(object_key))
+            .await?;
         let dst_versions_for_key: Vec<_> = dst_versions
             .iter()
             .filter(|v| v.key().map_or(false, |k| k == object_key))
@@ -626,7 +630,10 @@ impl MigrationVerifier {
             {
                 VersionedVerificationResult::Match => {}
                 result => {
-                    println!("✗ Version verification failed for {}: {:?}", object_key, result);
+                    println!(
+                        "✗ Version verification failed for {}: {:?}",
+                        object_key, result
+                    );
                     return Ok(false);
                 }
             }
@@ -641,9 +648,16 @@ impl MigrationVerifier {
 #[derive(Debug, PartialEq)]
 pub enum VersionedVerificationResult {
     Match,
-    VersionCountMismatch { expected: usize, actual: usize },
-    VersionIdMismatch { missing_version_id: String },
-    VersionContentMismatch { version_id: String },
+    VersionCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    VersionIdMismatch {
+        missing_version_id: String,
+    },
+    VersionContentMismatch {
+        version_id: String,
+    },
     VersionMetadataMismatch {
         version_id: String,
         field: String,

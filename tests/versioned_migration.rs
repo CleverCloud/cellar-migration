@@ -39,7 +39,9 @@ async fn test_simple_versioned_object_migration() -> Result<(), Box<dyn std::err
 
     // Create versioned test bucket manager
     let mut bucket_manager = TestBucketManager::new(config.clone()).await?;
-    let (src_bucket, dst_bucket) = bucket_manager.create_versioned_test_buckets(test_name).await?;
+    let (src_bucket, dst_bucket) = bucket_manager
+        .create_versioned_test_buckets(test_name)
+        .await?;
 
     println!("[{}] Setting up versioned test objects", test_name);
 
@@ -85,7 +87,10 @@ async fn test_simple_versioned_object_migration() -> Result<(), Box<dyn std::err
     .await?;
 
     // Run migration using the CLI (expected to not handle versions correctly yet)
-    println!("[{}] Running migration (version support not implemented yet)", test_name);
+    println!(
+        "[{}] Running migration (version support not implemented yet)",
+        test_name
+    );
     let migration_result = run_basic_migration(
         &config,
         &src_bucket,
@@ -130,12 +135,18 @@ async fn test_simple_versioned_object_migration() -> Result<(), Box<dyn std::err
     // Handle verification result - for now, we expect it to fail since version support isn't implemented
     match verification_result {
         Ok(true) => {
-            println!("[{}] ✓ All versioned objects verified successfully!", test_name);
+            println!(
+                "[{}] ✓ All versioned objects verified successfully!",
+                test_name
+            );
             Ok(())
         }
         Ok(false) => {
             println!("[{}] ✗ Versioned migration verification failed (expected - version support not implemented)", test_name);
-            println!("[{}] Test documents current behavior - version support needed", test_name);
+            println!(
+                "[{}] Test documents current behavior - version support needed",
+                test_name
+            );
             Err(format!("Version verification failed - migration tool doesn't support versioned objects yet").into())
         }
         Err(e) => {
@@ -182,7 +193,9 @@ async fn test_complex_versioned_object_migration() -> Result<(), Box<dyn std::er
 
     // Create versioned test bucket manager
     let mut bucket_manager = TestBucketManager::new(config.clone()).await?;
-    let (src_bucket, dst_bucket) = bucket_manager.create_versioned_test_buckets(test_name).await?;
+    let (src_bucket, dst_bucket) = bucket_manager
+        .create_versioned_test_buckets(test_name)
+        .await?;
 
     println!("[{}] Setting up complex versioned test objects", test_name);
 
@@ -335,12 +348,18 @@ async fn test_complex_versioned_object_migration() -> Result<(), Box<dyn std::er
     // Handle verification result - for now, we expect it to fail since version support isn't implemented
     match verification_result {
         Ok(true) => {
-            println!("[{}] ✓ All complex versioned objects verified successfully!", test_name);
+            println!(
+                "[{}] ✓ All complex versioned objects verified successfully!",
+                test_name
+            );
             Ok(())
         }
         Ok(false) => {
             println!("[{}] ✗ Complex versioned migration verification failed (expected - version support not implemented)", test_name);
-            println!("[{}] Test documents current behavior - comprehensive version support needed", test_name);
+            println!(
+                "[{}] Test documents current behavior - comprehensive version support needed",
+                test_name
+            );
             Err(format!("Version verification failed - migration tool doesn't support versioned objects yet").into())
         }
         Err(e) => {
@@ -369,7 +388,10 @@ async fn create_versioned_object(
     );
 
     if version_count == 0 {
-        println!("[{}] Object {} will have no versions (object doesn't exist)", test_name, object_key);
+        println!(
+            "[{}] Object {} will have no versions (object doesn't exist)",
+            test_name, object_key
+        );
         return Ok(Vec::new());
     }
 
@@ -378,13 +400,21 @@ async fn create_versioned_object(
     for version_num in 1..=version_count {
         // Create unique content for each version
         let version_content = format!("Version {} content for {}", version_num, object_key);
-        let full_content = format!("{}\n{}", version_content, "x".repeat(base_size - version_content.len() - 1));
+        let full_content = format!(
+            "{}\n{}",
+            version_content,
+            "x".repeat(base_size - version_content.len() - 1)
+        );
 
         // Create test file with version-specific content (no custom metadata)
-        let test_file = TestFile::new(&format!("{}-v{}", object_key, version_num), full_content.len());
+        let test_file = TestFile::new(
+            &format!("{}-v{}", object_key, version_num),
+            full_content.len(),
+        );
 
         // Generate file with version-specific content
-        let file_path = file_generator.generate_file_with_content(&test_file, full_content.as_bytes())?;
+        let file_path =
+            file_generator.generate_file_with_content(&test_file, full_content.as_bytes())?;
 
         // Upload clean versioned object (no metadata)
         let version_id = bucket_manager
@@ -396,7 +426,10 @@ async fn create_versioned_object(
 
         println!(
             "[{}] Created version {} for {}: version_id={}",
-            test_name, version_num, object_key, version_ids.last().unwrap()
+            test_name,
+            version_num,
+            object_key,
+            version_ids.last().unwrap()
         );
     }
 
@@ -425,7 +458,10 @@ async fn create_complex_versioned_object(
     );
 
     if version_count == 0 {
-        println!("[{}] Object {} will have no versions (object doesn't exist)", test_name, object_key);
+        println!(
+            "[{}] Object {} will have no versions (object doesn't exist)",
+            test_name, object_key
+        );
         return Ok(Vec::new());
     }
 
@@ -469,10 +505,14 @@ async fn create_complex_versioned_object(
         let full_content = format!("{}{}", version_content, padding);
 
         // Create test file with version-specific content (no metadata)
-        let test_file = TestFile::new(&format!("{}-v{}", object_key, version_num), full_content.len());
+        let test_file = TestFile::new(
+            &format!("{}-v{}", object_key, version_num),
+            full_content.len(),
+        );
 
         // Generate file with version-specific content
-        let file_path = file_generator.generate_file_with_content(&test_file, full_content.as_bytes())?;
+        let file_path =
+            file_generator.generate_file_with_content(&test_file, full_content.as_bytes())?;
 
         // Upload clean versioned object (no metadata)
         let version_id = bucket_manager
@@ -502,11 +542,17 @@ async fn verify_pre_migration_versions(
     objects_and_versions: &[(&str, &[String])],
     test_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("[{}] Verifying pre-migration versions in source bucket", test_name);
+    println!(
+        "[{}] Verifying pre-migration versions in source bucket",
+        test_name
+    );
 
     for (object_key, expected_versions) in objects_and_versions {
         if expected_versions.is_empty() {
-            println!("[{}] Skipping verification for {} (no versions)", test_name, object_key);
+            println!(
+                "[{}] Skipping verification for {} (no versions)",
+                test_name, object_key
+            );
             continue;
         }
 
@@ -563,14 +609,20 @@ async fn verify_complex_pre_migration_versions(
     objects_and_versions: &[(&str, Vec<String>)],
     test_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("[{}] Verifying complex pre-migration versions in source bucket", test_name);
+    println!(
+        "[{}] Verifying complex pre-migration versions in source bucket",
+        test_name
+    );
 
     let mut total_versions = 0;
     let mut objects_with_versions = 0;
 
     for (object_key, expected_versions) in objects_and_versions {
         if expected_versions.is_empty() {
-            println!("[{}] Skipping verification for {} (no versions)", test_name, object_key);
+            println!(
+                "[{}] Skipping verification for {} (no versions)",
+                test_name, object_key
+            );
             continue;
         }
 
@@ -643,11 +695,17 @@ async fn verify_versioned_migration_results(
 
     for (object_key, expected_versions) in objects_and_versions {
         if expected_versions.is_empty() {
-            println!("[{}] Skipping verification for {} (no versions expected)", test_name, object_key);
+            println!(
+                "[{}] Skipping verification for {} (no versions expected)",
+                test_name, object_key
+            );
             continue;
         }
 
-        println!("[{}] Verifying versions for object: {}", test_name, object_key);
+        println!(
+            "[{}] Verifying versions for object: {}",
+            test_name, object_key
+        );
 
         match MigrationVerifier::verify_versioned_migration(
             source_client,
@@ -675,10 +733,16 @@ async fn verify_versioned_migration_results(
     }
 
     if all_passed {
-        println!("[{}] ✓ All versioned objects verification passed", test_name);
+        println!(
+            "[{}] ✓ All versioned objects verification passed",
+            test_name
+        );
         Ok(true)
     } else {
-        println!("[{}] ✗ Some versioned objects verification failed", test_name);
+        println!(
+            "[{}] ✗ Some versioned objects verification failed",
+            test_name
+        );
         Ok(false)
     }
 }
@@ -692,7 +756,10 @@ async fn verify_complex_versioned_migration_results(
     objects_and_versions: &[(&str, Vec<String>)],
     test_name: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    println!("[{}] Verifying complex versioned migration results", test_name);
+    println!(
+        "[{}] Verifying complex versioned migration results",
+        test_name
+    );
 
     let mut all_passed = true;
     let mut total_versions_verified = 0;
@@ -700,12 +767,20 @@ async fn verify_complex_versioned_migration_results(
 
     for (object_key, expected_versions) in objects_and_versions {
         if expected_versions.is_empty() {
-            println!("[{}] Skipping verification for {} (no versions expected)", test_name, object_key);
+            println!(
+                "[{}] Skipping verification for {} (no versions expected)",
+                test_name, object_key
+            );
             continue;
         }
 
         let verification_start = std::time::Instant::now();
-        println!("[{}] Verifying versions for object: {} ({} versions)", test_name, object_key, expected_versions.len());
+        println!(
+            "[{}] Verifying versions for object: {} ({} versions)",
+            test_name,
+            object_key,
+            expected_versions.len()
+        );
 
         match MigrationVerifier::verify_versioned_migration(
             source_client,
@@ -761,9 +836,15 @@ async fn verify_complex_versioned_migration_results(
     .await?;
 
     if comprehensive_result {
-        println!("[{}] ✓ Comprehensive version verification passed", test_name);
+        println!(
+            "[{}] ✓ Comprehensive version verification passed",
+            test_name
+        );
     } else {
-        println!("[{}] ✗ Comprehensive version verification failed", test_name);
+        println!(
+            "[{}] ✗ Comprehensive version verification failed",
+            test_name
+        );
         all_passed = false;
     }
 

@@ -1,15 +1,12 @@
 use std::{
     collections::VecDeque,
-    pin::Pin,
-    sync::{Arc, Mutex},
-    task::{Context, Poll},
+    sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc, Mutex,
+    },
 };
 
 use aws_sdk_s3::primitives::ByteStream;
-use bytes::Bytes;
-use futures::Stream;
-use http_body::Body;
-use hyper::body::Incoming;
 use tokio::task::JoinError;
 use tracing::event;
 use tracing::Level;
@@ -29,13 +26,41 @@ pub struct ThreadMigrationResult {
 }
 
 #[derive(Debug, Clone)]
+struct KeyQueue {
+    key: String,
+    versions: VecDeque<ProviderObject>,
+}
+
+fn group_by_key(objects: Vec<ProviderObject>) -> VecDeque<KeyQueue> {
+    let mut grouped: VecDeque<KeyQueue> = VecDeque::new();
+
+    for object in objects {
+        let key = object.key().to_string();
+        if let Some(last) = grouped.back_mut() {
+            if last.key == key {
+                last.versions.push_back(object);
+                continue;
+            }
+        }
+
+        let mut versions = VecDeque::new();
+        versions.push_back(object);
+        grouped.push_back(KeyQueue { key, versions });
+    }
+
+    grouped
+}
+
+#[derive(Debug, Clone)]
 pub struct Uploader {
     source_provider_clients: Arc<Mutex<VecDeque<Box<dyn Provider>>>>,
     radosgw_clients: Arc<Mutex<VecDeque<RadosGW>>>,
-    objects: Arc<Mutex<VecDeque<ProviderObject>>>,
-    objects_to_delete: Arc<Mutex<VecDeque<ProviderObject>>>,
+    objects: Arc<Mutex<VecDeque<KeyQueue>>>,
+    objects_to_delete: Arc<Mutex<VecDeque<KeyQueue>>>,
     threads: usize,
     multipart_chunk_size: usize,
+    total_objects: usize,
+    total_objects_to_delete: usize,
 }
 
 impl Uploader {
@@ -47,7 +72,9 @@ impl Uploader {
         threads: usize,
         multipart_chunk_size: usize,
     ) -> Uploader {
-        let sync_len = objects.len() + objects_to_delete.len();
+        let total_objects = objects.len();
+        let total_objects_to_delete = objects_to_delete.len();
+        let sync_len = total_objects + total_objects_to_delete;
         if sync_len < threads {
             event!(
                 Level::WARN,
@@ -59,18 +86,32 @@ impl Uploader {
         Uploader {
             source_provider_clients,
             radosgw_clients,
-            objects: Arc::new(Mutex::new(VecDeque::from(objects))),
-            objects_to_delete: Arc::new(Mutex::new(VecDeque::from(objects_to_delete))),
-            threads: std::cmp::min(threads, sync_len),
+            objects: Arc::new(Mutex::new(group_by_key(objects))),
+            objects_to_delete: Arc::new(Mutex::new(group_by_key(objects_to_delete))),
+            threads: if sync_len == 0 {
+                0
+            } else {
+                std::cmp::min(threads, sync_len)
+            },
             multipart_chunk_size,
+            total_objects,
+            total_objects_to_delete,
         }
     }
 
     pub async fn sync(&mut self) -> Vec<Result<ThreadMigrationResult, JoinError>> {
         event!(Level::INFO, "Starting {} sync threads", self.threads);
+
+        if self.threads == 0 {
+            return Vec::new();
+        }
+
         let mut handles = Vec::new();
-        let total_files = self.objects.clone().lock().unwrap().len();
-        let total_files_to_delete = self.objects_to_delete.clone().lock().unwrap().len();
+        let total_files = self.total_objects;
+        let total_files_to_delete = self.total_objects_to_delete;
+
+        let processed_sync = Arc::new(AtomicUsize::new(0));
+        let processed_delete = Arc::new(AtomicUsize::new(0));
 
         for thread_id in 0..self.threads {
             let source_clients = self.source_provider_clients.clone();
@@ -78,32 +119,25 @@ impl Uploader {
             let files = self.objects.clone();
             let files_to_delete = self.objects_to_delete.clone();
             let multipart_chunk_size = self.multipart_chunk_size;
+            let processed_sync = processed_sync.clone();
+            let processed_delete = processed_delete.clone();
+
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
                 let mut delete_results = Vec::new();
+
                 loop {
-                    let (object, remaining) = {
+                    let maybe_group = {
                         let mut files = files.lock().unwrap();
-                        let object = files.pop_front();
-                        let remaining = files.len();
-                        (object, remaining)
+                        files.pop_front()
                     };
 
-                    let radosgw_client = radosgw_clients
-                        .lock()
-                        .expect("Tried to lock radosgw_clients mutex but failed")
-                        .pop_front()
-                        .expect("We should have a RadosGW client available");
-
-                    if let Some(object) = object {
-                        event!(
-                            Level::INFO,
-                            "Thread {} | ({}/{}) Starting to sync object {}",
-                            thread_id,
-                            total_files - remaining,
-                            total_files,
-                            object.get_key()
-                        );
+                    if let Some(mut group) = maybe_group {
+                        let radosgw_client = radosgw_clients
+                            .lock()
+                            .expect("Tried to lock radosgw_clients mutex but failed")
+                            .pop_front()
+                            .expect("We should have a RadosGW client available");
 
                         let source_client = source_clients
                             .lock()
@@ -111,17 +145,36 @@ impl Uploader {
                             .pop_front()
                             .expect("We should have a source client available");
 
-                        let result = Uploader::sync_object(
-                            &*source_client,
-                            &radosgw_client,
-                            &object,
-                            thread_id,
-                            multipart_chunk_size,
-                        )
-                        .await
-                        .map(|_| object.get_size() as usize);
+                        while let Some(object) = group.versions.pop_front() {
+                            let current = processed_sync.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                            let version_label = object
+                                .version_id()
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "legacy".to_string());
 
-                        results.push(result);
+                            event!(
+                                Level::INFO,
+                                "Thread {} | Syncing {} (version {}) [{}/{}]",
+                                thread_id,
+                                group.key,
+                                version_label,
+                                current,
+                                if total_files == 0 { 1 } else { total_files }
+                            );
+
+                            let result = Uploader::sync_object(
+                                &*source_client,
+                                &radosgw_client,
+                                &object,
+                                thread_id,
+                                multipart_chunk_size,
+                            )
+                            .await
+                            .map(|_| object.get_size() as usize);
+
+                            results.push(result);
+                        }
+
                         source_clients
                             .lock()
                             .expect("Tried to lock source_clients mutex but failed")
@@ -130,51 +183,65 @@ impl Uploader {
                             .lock()
                             .expect("Tried to lock radosgw_clients mutex but failed")
                             .push_back(radosgw_client);
-                    } else {
-                        let (object_to_delete, remaining) = {
-                            let mut files = files_to_delete.lock().unwrap();
-                            let object = files.pop_front();
-                            let remaining = files.len();
-                            (object, remaining)
-                        };
 
-                        if let Some(object_to_delete) = object_to_delete {
+                        continue;
+                    }
+
+                    let maybe_delete_group = {
+                        let mut files = files_to_delete.lock().unwrap();
+                        files.pop_front()
+                    };
+
+                    if let Some(mut delete_group) = maybe_delete_group {
+                        let radosgw_client = radosgw_clients
+                            .lock()
+                            .expect("Tried to lock radosgw_clients mutex but failed")
+                            .pop_front()
+                            .expect("We should have a RadosGW client available");
+
+                        while let Some(object) = delete_group.versions.pop_front() {
+                            let current = processed_delete.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+
                             event!(
                                 Level::INFO,
-                                "Thread {} | ({}/{}) Deleting object {} on destination bucket",
+                                "Thread {} | Deleting {} (version {:?}) [{}/{}]",
                                 thread_id,
-                                total_files_to_delete - remaining,
-                                total_files_to_delete,
-                                object_to_delete.get_key()
+                                delete_group.key,
+                                object.version_id(),
+                                current,
+                                if total_files_to_delete == 0 {
+                                    1
+                                } else {
+                                    total_files_to_delete
+                                }
                             );
 
                             let result = Uploader::delete_destination_object(
                                 &radosgw_client,
-                                object_to_delete,
+                                object,
                                 thread_id,
                             )
                             .await
                             .map(|object| object.get_size() as usize);
 
-                            radosgw_clients
-                                .lock()
-                                .expect("Tried to lock radosgw_clients mutex but failed")
-                                .push_back(radosgw_client);
                             delete_results.push(result);
-                        } else {
-                            event!(
-                                Level::INFO,
-                                "Thread {} | No more objects to synchronize, quitting..",
-                                thread_id
-                            );
-                            radosgw_clients
-                                .lock()
-                                .expect("Tried to lock radosgw_clients mutex but failed")
-                                .push_back(radosgw_client);
-
-                            break;
                         }
+
+                        radosgw_clients
+                            .lock()
+                            .expect("Tried to lock radosgw_clients mutex but failed")
+                            .push_back(radosgw_client);
+
+                        continue;
                     }
+
+                    event!(
+                        Level::INFO,
+                        "Thread {} | No more objects to synchronize, quitting..",
+                        thread_id
+                    );
+
+                    break;
                 }
 
                 ThreadMigrationResult {
@@ -196,8 +263,24 @@ impl Uploader {
         thread_id: usize,
         multipart_chunk_size: usize,
     ) -> anyhow::Result<()> {
-        let object_metadata = source_provider_client.get_object_metadata(object).await?;
-        let mut response = source_provider_client.get_object(object).await?;
+        let (mut object_metadata, mut response) = if object.version_id().is_some() {
+            let metadata = source_provider_client
+                .get_object_version_metadata(object)
+                .await?;
+            let response = source_provider_client.get_object_version(object).await?;
+            (metadata, response)
+        } else {
+            let metadata = source_provider_client.get_object_metadata(object).await?;
+            let response = source_provider_client.get_object(object).await?;
+            (metadata, response)
+        };
+
+        if let Some(version_id) = object.version_id() {
+            object_metadata
+                .user_metadata
+                .insert("version-id".to_string(), version_id.to_string());
+        }
+
         if response.success() {
             let start = std::time::Instant::now();
             let object_size = object.get_size() as usize;
@@ -230,9 +313,10 @@ impl Uploader {
             }
             event!(
                 Level::INFO,
-                "Thread {} | Object {} has been put in {:?}",
+                "Thread {} | Object {} (version {:?}) has been put in {:?}",
                 thread_id,
                 object.get_key(),
+                object.version_id(),
                 start.elapsed()
             );
             Ok(())
@@ -426,6 +510,7 @@ impl Uploader {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DownloadError {
     pub code: u16,
     pub message: Option<String>,
@@ -451,4 +536,3 @@ impl std::fmt::Display for DownloadError {
         write!(f, "{:#?}", &self)
     }
 }
-

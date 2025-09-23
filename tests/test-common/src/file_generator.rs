@@ -173,6 +173,32 @@ impl FileGenerator {
         Ok(file_path)
     }
 
+    /// Generate a file with custom content
+    pub fn generate_file_with_content(
+        &self,
+        test_file: &TestFile,
+        content: &[u8]
+    ) -> Result<PathBuf, std::io::Error> {
+        let file_path = self.temp_dir.join(&test_file.path);
+
+        // Create parent directories if they don't exist
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::write(&file_path, content)?;
+
+        if test_file.size > 1_000_000 {
+            println!(
+                "Generated custom content file: {} (size: {} bytes)",
+                test_file.key(),
+                content.len()
+            );
+        }
+
+        Ok(file_path)
+    }
+
     /// Compute the MD5 checksum of a generated file and return it as a lowercase hex string
     pub fn compute_md5(&self, file_path: &Path) -> Result<String, std::io::Error> {
         let mut file = fs::File::open(file_path)?;

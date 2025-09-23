@@ -453,4 +453,201 @@ impl MigrationVerifier {
         }
         exists
     }
+
+    /// Verify versioned object migration by comparing all versions between source and destination
+    pub async fn verify_versioned_migration(
+        source_client: &S3TestClient,
+        dest_client: &S3TestClient,
+        src_bucket: &str,
+        dst_bucket: &str,
+        object_key: &str,
+    ) -> Result<VersionedVerificationResult, Box<dyn std::error::Error>> {
+        println!("Verifying versioned migration for object: {}", object_key);
+
+        // Get all versions from source bucket
+        let src_versions = source_client.list_object_versions(src_bucket, Some(object_key)).await?;
+        let src_versions_for_key: Vec<_> = src_versions
+            .iter()
+            .filter(|v| v.key().map_or(false, |k| k == object_key))
+            .collect();
+
+        // Get all versions from destination bucket
+        let dst_versions = dest_client.list_object_versions(dst_bucket, Some(object_key)).await?;
+        let dst_versions_for_key: Vec<_> = dst_versions
+            .iter()
+            .filter(|v| v.key().map_or(false, |k| k == object_key))
+            .collect();
+
+        println!(
+            "  Source versions: {}, Destination versions: {}",
+            src_versions_for_key.len(),
+            dst_versions_for_key.len()
+        );
+
+        // Check if version counts match
+        if src_versions_for_key.len() != dst_versions_for_key.len() {
+            return Ok(VersionedVerificationResult::VersionCountMismatch {
+                expected: src_versions_for_key.len(),
+                actual: dst_versions_for_key.len(),
+            });
+        }
+
+        // Create a map of destination versions by version ID for quick lookup
+        let mut dst_version_map = std::collections::HashMap::new();
+        for dst_version in &dst_versions_for_key {
+            if let Some(version_id) = dst_version.version_id() {
+                dst_version_map.insert(version_id.to_string(), dst_version);
+            }
+        }
+
+        // Verify each source version exists in destination with matching version ID
+        for src_version in &src_versions_for_key {
+            if let Some(src_version_id) = src_version.version_id() {
+                // Check if version ID exists in destination
+                if !dst_version_map.contains_key(src_version_id) {
+                    return Ok(VersionedVerificationResult::VersionIdMismatch {
+                        missing_version_id: src_version_id.to_string(),
+                    });
+                }
+
+                // Verify content matches for this version
+                let src_content = source_client
+                    .get_object_version(src_bucket, object_key, src_version_id)
+                    .await?;
+                let dst_content = dest_client
+                    .get_object_version(dst_bucket, object_key, src_version_id)
+                    .await?;
+
+                if src_content != dst_content {
+                    return Ok(VersionedVerificationResult::VersionContentMismatch {
+                        version_id: src_version_id.to_string(),
+                    });
+                }
+
+                // Verify metadata matches for this version
+                let src_metadata = source_client
+                    .get_object_metadata_version(src_bucket, object_key, src_version_id)
+                    .await?;
+                let dst_metadata = dest_client
+                    .get_object_metadata_version(dst_bucket, object_key, src_version_id)
+                    .await?;
+
+                // Basic metadata comparison (size, content-type)
+                if src_metadata.content_length() != dst_metadata.content_length() {
+                    return Ok(VersionedVerificationResult::VersionMetadataMismatch {
+                        version_id: src_version_id.to_string(),
+                        field: "content-length".to_string(),
+                        expected: format!("{:?}", src_metadata.content_length()),
+                        actual: format!("{:?}", dst_metadata.content_length()),
+                    });
+                }
+
+                if src_metadata.content_type() != dst_metadata.content_type() {
+                    return Ok(VersionedVerificationResult::VersionMetadataMismatch {
+                        version_id: src_version_id.to_string(),
+                        field: "content-type".to_string(),
+                        expected: format!("{:?}", src_metadata.content_type()),
+                        actual: format!("{:?}", dst_metadata.content_type()),
+                    });
+                }
+
+                println!("  ✓ Version {} verified successfully", src_version_id);
+            }
+        }
+
+        println!("✓ All versions verified successfully for {}", object_key);
+        Ok(VersionedVerificationResult::Match)
+    }
+
+    /// Verify all versioned objects in both buckets match
+    pub async fn verify_all_versioned_objects_migrated(
+        source_client: &S3TestClient,
+        dest_client: &S3TestClient,
+        src_bucket: &str,
+        dst_bucket: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        println!(
+            "Verifying all versioned objects migrated from {} to {}",
+            src_bucket, dst_bucket
+        );
+
+        // Get all versions from both buckets
+        let src_versions = source_client.list_object_versions(src_bucket, None).await?;
+        let dst_versions = dest_client.list_object_versions(dst_bucket, None).await?;
+
+        println!(
+            "Source bucket {} contains {} versions across all objects",
+            src_bucket,
+            src_versions.len()
+        );
+        println!(
+            "Destination bucket {} contains {} versions across all objects",
+            dst_bucket,
+            dst_versions.len()
+        );
+
+        // Group versions by object key
+        let mut src_objects = std::collections::HashMap::new();
+        for version in &src_versions {
+            if let Some(key) = version.key() {
+                src_objects
+                    .entry(key.to_string())
+                    .or_insert_with(Vec::new)
+                    .push(version);
+            }
+        }
+
+        let mut dst_objects = std::collections::HashMap::new();
+        for version in &dst_versions {
+            if let Some(key) = version.key() {
+                dst_objects
+                    .entry(key.to_string())
+                    .or_insert_with(Vec::new)
+                    .push(version);
+            }
+        }
+
+        // Check that all source objects exist in destination
+        for (object_key, _src_versions) in &src_objects {
+            if !dst_objects.contains_key(object_key) {
+                println!("✗ Object {} missing from destination bucket", object_key);
+                return Ok(false);
+            }
+
+            // Verify this specific object's versions
+            match Self::verify_versioned_migration(
+                source_client,
+                dest_client,
+                src_bucket,
+                dst_bucket,
+                object_key,
+            )
+            .await?
+            {
+                VersionedVerificationResult::Match => {}
+                result => {
+                    println!("✗ Version verification failed for {}: {:?}", object_key, result);
+                    return Ok(false);
+                }
+            }
+        }
+
+        println!("✓ All versioned objects successfully migrated");
+        Ok(true)
+    }
+}
+
+/// Result of versioned object verification
+#[derive(Debug, PartialEq)]
+pub enum VersionedVerificationResult {
+    Match,
+    VersionCountMismatch { expected: usize, actual: usize },
+    VersionIdMismatch { missing_version_id: String },
+    VersionContentMismatch { version_id: String },
+    VersionMetadataMismatch {
+        version_id: String,
+        field: String,
+        expected: String,
+        actual: String,
+    },
 }

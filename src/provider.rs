@@ -127,6 +127,7 @@ pub struct ProviderObjectMetadata {
     pub content_language: Option<String>,
     pub content_md5: Option<String>,
     pub expires: Option<DateTime<Utc>>,
+    pub user_metadata: std::collections::HashMap<String, String>,
 }
 
 impl From<aws_sdk_s3::operation::head_object::HeadObjectOutput> for ProviderObjectMetadata {
@@ -178,6 +179,7 @@ impl From<aws_sdk_s3::operation::head_object::HeadObjectOutput> for ProviderObje
             content_language: value.content_language,
             content_md5,
             expires,
+            user_metadata: value.metadata.unwrap_or_default(),
         }
     }
 }

@@ -163,6 +163,11 @@ impl RadosGW {
                     .expires
                     .map(aws_smithy_types::date_time::DateTime::from_chrono_utc),
             )
+            .set_metadata(if object_metadata.user_metadata.is_empty() {
+                None
+            } else {
+                Some(object_metadata.user_metadata.clone())
+            })
             .send()
             .await
     }
@@ -197,6 +202,11 @@ impl RadosGW {
                     .expires
                     .map(aws_smithy_types::date_time::DateTime::from_chrono_utc),
             )
+            .set_metadata(if object_metadata.user_metadata.is_empty() {
+                None
+            } else {
+                Some(object_metadata.user_metadata.clone())
+            })
             .send()
             .await
     }

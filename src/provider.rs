@@ -44,17 +44,52 @@ impl ProviderConf {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderVersionKind {
+    Legacy,
+    Versioned {
+        id: String,
+        metadata: Option<Box<ProviderObjectMetadata>>,
+    },
+    DeleteMarker {
+        id: String,
+    },
+}
+
+impl ProviderVersionKind {
+    pub fn version_id(&self) -> Option<&str> {
+        match self {
+            ProviderVersionKind::Legacy => None,
+            ProviderVersionKind::Versioned { id, .. } => Some(id.as_str()),
+            ProviderVersionKind::DeleteMarker { id } => Some(id.as_str()),
+        }
+    }
+
+    pub fn metadata(&self) -> Option<&ProviderObjectMetadata> {
+        match self {
+            ProviderVersionKind::Legacy => None,
+            ProviderVersionKind::Versioned { metadata, .. } => metadata.as_deref(),
+            ProviderVersionKind::DeleteMarker { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderObject {
     key: String,
     last_modified: DateTime<Utc>,
     etag: String,
     size: u64,
+    version: ProviderVersionKind,
 }
 
 impl ProviderObject {
     pub fn get_key(&self) -> String {
         self.key.clone()
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
     }
 
     pub fn get_last_modified(&self) -> &DateTime<Utc> {
@@ -67,6 +102,65 @@ impl ProviderObject {
 
     pub fn get_size(&self) -> u64 {
         self.size
+    }
+
+    pub fn version_kind(&self) -> &ProviderVersionKind {
+        &self.version
+    }
+
+    pub fn version_id(&self) -> Option<&str> {
+        self.version.version_id()
+    }
+
+    pub fn version_metadata(&self) -> Option<&ProviderObjectMetadata> {
+        self.version.metadata()
+    }
+
+    pub fn with_version(mut self, version: ProviderVersionKind) -> Self {
+        self.version = version;
+        self
+    }
+
+    pub fn is_delete_marker(&self) -> bool {
+        matches!(self.version, ProviderVersionKind::DeleteMarker { .. })
+    }
+
+    pub fn from_version_record(value: &aws_sdk_s3::types::ObjectVersion) -> Self {
+        let key = value
+            .key
+            .clone()
+            .expect("Object version key shouldn't be null");
+        let last_modified = value
+            .last_modified
+            .map(|e| {
+                e.to_chrono_utc().unwrap_or_else(|_| {
+                    panic!(
+                        "Should be able to transform AWS datetime {:?} to chrono datetime",
+                        e
+                    )
+                })
+            })
+            .expect("Object version last_modified shouldn't be null");
+        let etag = value
+            .e_tag
+            .clone()
+            .expect("Object version ETag shouldn't be null");
+        let size = value.size.expect("Object version size shouldn't be null") as u64;
+        let version_id = value
+            .version_id
+            .clone()
+            .expect("Object version should have version_id");
+
+        ProviderObject {
+            key,
+            last_modified,
+            etag,
+            size,
+            version: ProviderVersionKind::Versioned {
+                id: version_id,
+                metadata: None,
+            },
+        }
     }
 }
 
@@ -87,6 +181,7 @@ impl From<&aws_sdk_s3::types::Object> for ProviderObject {
                 .expect("Object last_modified shouldn't be null"),
             etag: value.e_tag.clone().expect("Object ETag shouldn't be null"),
             size: value.size.expect("Object size shouldn't be null") as u64,
+            version: ProviderVersionKind::Legacy,
         }
     }
 }
@@ -95,6 +190,21 @@ impl PartialEq<ProviderObject> for ProviderObject {
     #[instrument(skip_all, level = "trace")]
     fn eq(&self, other: &ProviderObject) -> bool {
         event!(Level::TRACE, "Self: {:#?}\nOther: {:#?}", self, other);
+
+        match (&self.version, &other.version) {
+            (ProviderVersionKind::Legacy, ProviderVersionKind::Legacy) => {}
+            (
+                ProviderVersionKind::Versioned { id: left_id, .. },
+                ProviderVersionKind::Versioned { id: right_id, .. },
+            ) if left_id == right_id => {}
+            (
+                ProviderVersionKind::DeleteMarker { id: left_id },
+                ProviderVersionKind::DeleteMarker { id: right_id },
+            ) if left_id == right_id => {}
+            _ => {
+                return false;
+            }
+        }
 
         if other.key == self.key && other.size == self.get_size() {
             if other.etag == self.etag {
@@ -114,7 +224,7 @@ impl PartialEq<ProviderObject> for ProviderObject {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderObjectMetadata {
     pub acl_public: bool,
     pub last_modified: Option<DateTime<Utc>>,
@@ -309,7 +419,16 @@ pub trait Provider: Debug + DynClone + Send + Sync {
         max_keys: Option<usize>,
         start_after: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<Vec<ProviderObject>>> + '_>>;
+    fn list_object_versions(
+        &self,
+        max_keys: Option<usize>,
+        start_after: Option<String>,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<Vec<ProviderObject>>> + '_>>;
     async fn get_object_metadata(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<ProviderObjectMetadata>;
+    async fn get_object_version_metadata(
         &self,
         object: &ProviderObject,
     ) -> anyhow::Result<ProviderObjectMetadata>;
@@ -317,6 +436,12 @@ pub trait Provider: Debug + DynClone + Send + Sync {
         &self,
         object: &ProviderObject,
     ) -> anyhow::Result<Box<dyn ProviderResponse>>;
+    async fn get_object_version(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<Box<dyn ProviderResponse>>;
+    async fn is_bucket_versioned(&self) -> anyhow::Result<bool>;
+    async fn enable_bucket_versioning(&self) -> anyhow::Result<()>;
 }
 
 dyn_clone::clone_trait_object!(Provider);

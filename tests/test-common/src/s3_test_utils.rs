@@ -122,10 +122,117 @@ impl S3TestClient {
         Ok(())
     }
 
-    /// Delete a bucket and all its contents
+    /// Delete a bucket and all its contents (including all versions and delete markers)
+    /// This is the comprehensive cleanup method that should be used by all tests
     pub async fn delete_bucket(&self, bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // First delete all objects in the bucket
+        println!("Cleaning up bucket: {}", bucket_name);
+
+        // First, try to delete all object versions and delete markers
+        // This handles versioned buckets properly
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+        let mut total_versions_deleted = 0;
+        let mut total_delete_markers_deleted = 0;
+
+        loop {
+            let mut list_request = self
+                .client
+                .list_object_versions()
+                .bucket(bucket_name)
+                .max_keys(1000);
+
+            if let Some(key) = &key_marker {
+                list_request = list_request.key_marker(key);
+            }
+
+            if let Some(version_id) = &version_id_marker {
+                list_request = list_request.version_id_marker(version_id);
+            }
+
+            let response = match list_request.send().await {
+                Ok(resp) => resp,
+                Err(_) => {
+                    // If list_object_versions fails, bucket might not exist or not be versioned
+                    // Fall back to regular object deletion
+                    break;
+                }
+            };
+
+            // Delete all object versions
+            let versions = response.versions();
+            if !versions.is_empty() {
+                for version in versions {
+                    if let (Some(key), Some(version_id)) = (version.key(), version.version_id()) {
+                        match self
+                            .client
+                            .delete_object()
+                            .bucket(bucket_name)
+                            .key(key)
+                            .version_id(version_id)
+                            .send()
+                            .await
+                        {
+                            Ok(_) => {
+                                total_versions_deleted += 1;
+                            }
+                            Err(e) => {
+                                println!(
+                                    "Warning: Failed to delete version {} of {}: {}",
+                                    version_id, key, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Delete all delete markers
+            let delete_markers = response.delete_markers();
+            if !delete_markers.is_empty() {
+                for marker in delete_markers {
+                    if let (Some(key), Some(version_id)) = (marker.key(), marker.version_id()) {
+                        match self
+                            .client
+                            .delete_object()
+                            .bucket(bucket_name)
+                            .key(key)
+                            .version_id(version_id)
+                            .send()
+                            .await
+                        {
+                            Ok(_) => {
+                                total_delete_markers_deleted += 1;
+                            }
+                            Err(e) => {
+                                println!(
+                                    "Warning: Failed to delete marker {} of {}: {}",
+                                    version_id, key, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            let is_truncated = response.is_truncated().unwrap_or(false);
+            if !is_truncated {
+                break;
+            }
+
+            key_marker = response.next_key_marker().map(|s| s.to_string());
+            version_id_marker = response.next_version_id_marker().map(|s| s.to_string());
+        }
+
+        if total_versions_deleted > 0 || total_delete_markers_deleted > 0 {
+            println!(
+                "Deleted {} versions and {} delete markers from {}",
+                total_versions_deleted, total_delete_markers_deleted, bucket_name
+            );
+        }
+
+        // Now delete any remaining regular objects (for non-versioned buckets or as fallback)
         let mut continuation_token: Option<String> = None;
+        let mut total_objects_deleted = 0;
 
         loop {
             let mut list_request = self
@@ -138,20 +245,32 @@ impl S3TestClient {
                 list_request = list_request.continuation_token(token);
             }
 
-            let response = list_request.send().await?;
+            let response = match list_request.send().await {
+                Ok(resp) => resp,
+                Err(_) => {
+                    // Bucket might not exist anymore
+                    break;
+                }
+            };
 
             let objects = response.contents();
             if !objects.is_empty() {
-                // Delete objects in batches
-                for chunk in objects.chunks(1000) {
-                    for object in chunk {
-                        if let Some(key) = &object.key {
-                            self.client
-                                .delete_object()
-                                .bucket(bucket_name)
-                                .key(key)
-                                .send()
-                                .await?;
+                for object in objects {
+                    if let Some(key) = &object.key {
+                        match self
+                            .client
+                            .delete_object()
+                            .bucket(bucket_name)
+                            .key(key)
+                            .send()
+                            .await
+                        {
+                            Ok(_) => {
+                                total_objects_deleted += 1;
+                            }
+                            Err(e) => {
+                                println!("Warning: Failed to delete {}: {}", key, e);
+                            }
                         }
                     }
                 }
@@ -164,14 +283,25 @@ impl S3TestClient {
             continuation_token = response.next_continuation_token().map(|s| s.to_string());
         }
 
-        // Now delete the bucket itself
-        self.client
-            .delete_bucket()
-            .bucket(bucket_name)
-            .send()
-            .await?;
+        if total_objects_deleted > 0 {
+            println!(
+                "Deleted {} regular objects from {}",
+                total_objects_deleted, bucket_name
+            );
+        }
 
-        Ok(())
+        // Finally, delete the bucket itself
+        match self.client.delete_bucket().bucket(bucket_name).send().await {
+            Ok(_) => {
+                println!("Successfully deleted bucket: {}", bucket_name);
+                Ok(())
+            }
+            Err(e) => {
+                println!("Warning: Failed to delete bucket {}: {}", bucket_name, e);
+                // Don't fail the test if bucket deletion fails - it might have been already deleted
+                Ok(())
+            }
+        }
     }
 
     /// Upload a test file to S3 with metadata
@@ -586,6 +716,493 @@ impl S3TestClient {
             sleep(Duration::from_millis(250)).await;
         }
     }
+
+    /// Enable versioning on a bucket
+    pub async fn enable_bucket_versioning(
+        &self,
+        bucket_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.client
+            .put_bucket_versioning()
+            .bucket(bucket_name)
+            .versioning_configuration(
+                aws_sdk_s3::types::VersioningConfiguration::builder()
+                    .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Get bucket versioning status
+    pub async fn get_bucket_versioning(
+        &self,
+        bucket_name: &str,
+    ) -> Result<aws_sdk_s3::types::BucketVersioningStatus, Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .get_bucket_versioning()
+            .bucket(bucket_name)
+            .send()
+            .await?;
+
+        Ok(response
+            .status()
+            .cloned()
+            .unwrap_or(aws_sdk_s3::types::BucketVersioningStatus::Suspended))
+    }
+
+    /// List all versions of objects in a bucket
+    pub async fn list_object_versions(
+        &self,
+        bucket_name: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<aws_sdk_s3::types::ObjectVersion>, Box<dyn std::error::Error>> {
+        let mut versions = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+
+        loop {
+            let mut list_request = self
+                .client
+                .list_object_versions()
+                .bucket(bucket_name)
+                .max_keys(1000);
+
+            if let Some(prefix) = prefix {
+                list_request = list_request.prefix(prefix);
+            }
+
+            if let Some(key_marker) = &key_marker {
+                list_request = list_request.key_marker(key_marker);
+            }
+
+            if let Some(version_id_marker) = &version_id_marker {
+                list_request = list_request.version_id_marker(version_id_marker);
+            }
+
+            let response = list_request.send().await?;
+
+            let object_versions = response.versions();
+            versions.extend_from_slice(object_versions);
+
+            let is_truncated = response.is_truncated().unwrap_or(false);
+            if !is_truncated {
+                break;
+            }
+
+            key_marker = response.next_key_marker().map(|s| s.to_string());
+            version_id_marker = response.next_version_id_marker().map(|s| s.to_string());
+        }
+
+        Ok(versions)
+    }
+
+    /// Get object content for a specific version
+    pub async fn get_object_version(
+        &self,
+        bucket_name: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .get_object()
+            .bucket(bucket_name)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await?;
+
+        let bytes = response.body.collect().await?.into_bytes();
+        Ok(bytes.to_vec())
+    }
+
+    /// Get object metadata for a specific version
+    pub async fn get_object_metadata_version(
+        &self,
+        bucket_name: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<aws_sdk_s3::operation::head_object::HeadObjectOutput, Box<dyn std::error::Error>>
+    {
+        let response = self
+            .client
+            .head_object()
+            .bucket(bucket_name)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await?;
+
+        Ok(response)
+    }
+
+    /// Upload a test file to S3 with no metadata, returning the version ID
+    pub async fn upload_test_file_versioned(
+        &self,
+        bucket_name: &str,
+        object_key: &str,
+        file_path: &Path,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let start_time = std::time::Instant::now();
+        let file_size = std::fs::metadata(file_path)?.len();
+
+        if file_size > 1_000_000 {
+            println!(
+                "Uploading versioned: {} -> s3://{}/{} (size: {} bytes)",
+                file_path.display(),
+                bucket_name,
+                object_key,
+                file_size
+            );
+        }
+
+        const MAX_ATTEMPTS: usize = 5;
+        const INITIAL_BACKOFF_MS: u64 = 200;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            if attempt > 1 {
+                println!(
+                    "Retrying versioned upload for {} (attempt {}/{})",
+                    object_key, attempt, MAX_ATTEMPTS
+                );
+            }
+
+            let file_content = std::fs::read(file_path)?;
+            let md5_hash = md5::compute(&file_content);
+            let content_md5 = base64::engine::general_purpose::STANDARD.encode(md5_hash.as_ref());
+
+            let body = ByteStream::from(file_content);
+
+            // Clean upload with no metadata - only essential S3 parameters
+            let put_request = self
+                .client
+                .put_object()
+                .bucket(bucket_name)
+                .key(object_key)
+                .body(body)
+                .content_md5(&content_md5);
+
+            match put_request.send().await {
+                Ok(output) => {
+                    if attempt > 1 {
+                        println!(
+                            "Versioned upload succeeded for {} after {} attempts",
+                            object_key, attempt
+                        );
+                    }
+
+                    let version_id = output
+                        .version_id()
+                        .ok_or_else(|| {
+                            format!("No version ID returned for upload of {}", object_key)
+                        })?
+                        .to_string();
+
+                    if file_size > 1_000_000 {
+                        println!(
+                            "Uploaded versioned {} (version: {}) in {:.2}s",
+                            object_key,
+                            version_id,
+                            start_time.elapsed().as_secs_f64()
+                        );
+                    }
+
+                    return Ok(version_id);
+                }
+                Err(err) => {
+                    let (retryable, detail) = match &err {
+                        SdkError::DispatchFailure(dispatch_err) => {
+                            let mut detail_parts = Vec::new();
+                            if dispatch_err.is_timeout() {
+                                detail_parts.push("timeout".to_string());
+                            }
+                            if dispatch_err.is_io() {
+                                detail_parts.push("io".to_string());
+                            }
+                            if dispatch_err.is_other() {
+                                detail_parts.push("other".to_string());
+                            }
+                            if dispatch_err.is_user() {
+                                detail_parts.push("user".to_string());
+                            }
+
+                            if let Some(connector_error) = dispatch_err.as_connector_error() {
+                                detail_parts.push(format!("connector: {}", connector_error));
+
+                                if let Some(source) = connector_error.source() {
+                                    let source_msg = source.to_string();
+                                    if !source_msg.is_empty() {
+                                        detail_parts.push(format!("source: {}", source_msg));
+                                    }
+                                }
+                            }
+
+                            let retryable = !dispatch_err.is_user();
+                            let detail = if detail_parts.is_empty() {
+                                "dispatch failure".to_string()
+                            } else {
+                                format!("dispatch failure ({})", detail_parts.join(", "))
+                            };
+
+                            (retryable, detail)
+                        }
+                        SdkError::TimeoutError(_) => (true, "timeout error".to_string()),
+                        SdkError::ResponseError(_) => (true, "response parsing error".to_string()),
+                        SdkError::ServiceError(service_err) => {
+                            use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+                            let status = service_err.raw().status();
+                            let code = service_err.err().code();
+                            let message = service_err.err().message();
+                            let retryable = status.is_server_error()
+                                || status.as_u16() == 429
+                                || matches!(
+                                    code,
+                                    Some("SlowDown")
+                                        | Some("RequestTimeout")
+                                        | Some("Throttling")
+                                        | Some("InternalError")
+                                );
+
+                            let mut detail = format!("service error (status {})", status);
+                            if let Some(code) = code {
+                                detail.push_str(&format!(" code {}", code));
+                            }
+                            if let Some(message) = message {
+                                detail.push_str(&format!(" message {}", message));
+                            }
+
+                            (retryable, detail)
+                        }
+                        SdkError::ConstructionFailure(_) => {
+                            (false, "request construction failure".to_string())
+                        }
+                        other => (false, format!("unhandled error: {other:?}")),
+                    };
+                    if attempt == MAX_ATTEMPTS || !retryable {
+                        return Err(format!(
+                            "PutObject versioned {} -> {} failed after {} attempts: {}",
+                            object_key, bucket_name, attempt, detail
+                        )
+                        .into());
+                    }
+
+                    let backoff_ms = INITIAL_BACKOFF_MS * (1u64 << (attempt - 1));
+                    println!(
+                        "Versioned upload attempt {} for {} failed: {}; retrying in {} ms",
+                        attempt, object_key, detail, backoff_ms
+                    );
+                    sleep(Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+
+        Err("Versioned upload failed after all attempts".into())
+    }
+
+    /// Upload a test file to S3 with full metadata support, returning the version ID
+    pub async fn upload_test_file_versioned_with_attributes(
+        &self,
+        bucket_name: &str,
+        object_key: &str,
+        test_file: &TestFile,
+        file_path: &Path,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let start_time = std::time::Instant::now();
+        let file_size = std::fs::metadata(file_path)?.len();
+
+        if file_size > 1_000_000 || test_file.content_type.is_some() {
+            println!(
+                "Uploading versioned with attributes: {} -> s3://{}/{} (size: {} bytes, content_type: {:?})",
+                file_path.display(),
+                bucket_name,
+                object_key,
+                file_size,
+                test_file.content_type.as_deref().unwrap_or("none")
+            );
+        }
+
+        const MAX_ATTEMPTS: usize = 5;
+        const INITIAL_BACKOFF_MS: u64 = 200;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            if attempt > 1 {
+                println!(
+                    "Retrying versioned upload with attributes for {} (attempt {}/{})",
+                    object_key, attempt, MAX_ATTEMPTS
+                );
+            }
+
+            let file_content = std::fs::read(file_path)?;
+            let md5_hash = md5::compute(&file_content);
+            let content_md5 = base64::engine::general_purpose::STANDARD.encode(md5_hash.as_ref());
+
+            let body = ByteStream::from(file_content);
+
+            let mut put_request = self
+                .client
+                .put_object()
+                .bucket(bucket_name)
+                .key(object_key)
+                .body(body)
+                .content_md5(&content_md5);
+
+            // Add metadata if present
+            if let Some(content_type) = &test_file.content_type {
+                put_request = put_request.content_type(content_type);
+            }
+
+            if let Some(cache_control) = &test_file.cache_control {
+                put_request = put_request.cache_control(cache_control);
+            }
+
+            if let Some(content_disposition) = &test_file.content_disposition {
+                put_request = put_request.content_disposition(content_disposition);
+            }
+
+            if let Some(content_encoding) = &test_file.content_encoding {
+                put_request = put_request.content_encoding(content_encoding);
+            }
+
+            if let Some(content_language) = &test_file.content_language {
+                put_request = put_request.content_language(content_language);
+            }
+
+            if let Some(expires) = &test_file.expires {
+                let timestamp = expires.timestamp();
+                put_request = put_request.expires(aws_smithy_types::DateTime::from_secs(timestamp));
+            }
+
+            if !test_file.metadata.is_empty() {
+                for (key, value) in &test_file.metadata {
+                    put_request = put_request.metadata(key.clone(), value.clone());
+                }
+            }
+
+            if test_file.acl_public {
+                put_request = put_request.acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead);
+            }
+
+            match put_request.send().await {
+                Ok(output) => {
+                    if attempt > 1 {
+                        println!(
+                            "Versioned upload with attributes succeeded for {} after {} attempts",
+                            object_key, attempt
+                        );
+                    }
+
+                    let version_id = output
+                        .version_id()
+                        .ok_or_else(|| {
+                            format!("No version ID returned for upload of {}", object_key)
+                        })?
+                        .to_string();
+
+                    if file_size > 1_000_000 || test_file.content_type.is_some() {
+                        println!(
+                            "Uploaded versioned with attributes {} (version: {}) in {:.2}s",
+                            object_key,
+                            version_id,
+                            start_time.elapsed().as_secs_f64()
+                        );
+                    }
+
+                    return Ok(version_id);
+                }
+                Err(err) => {
+                    let (retryable, detail) = match &err {
+                        SdkError::DispatchFailure(dispatch_err) => {
+                            let mut detail_parts = Vec::new();
+                            if dispatch_err.is_timeout() {
+                                detail_parts.push("timeout".to_string());
+                            }
+                            if dispatch_err.is_io() {
+                                detail_parts.push("io".to_string());
+                            }
+                            if dispatch_err.is_other() {
+                                detail_parts.push("other".to_string());
+                            }
+                            if dispatch_err.is_user() {
+                                detail_parts.push("user".to_string());
+                            }
+
+                            if let Some(connector_error) = dispatch_err.as_connector_error() {
+                                detail_parts.push(format!("connector: {}", connector_error));
+
+                                if let Some(source) = connector_error.source() {
+                                    let source_msg = source.to_string();
+                                    if !source_msg.is_empty() {
+                                        detail_parts.push(format!("source: {}", source_msg));
+                                    }
+                                }
+                            }
+
+                            let retryable = !dispatch_err.is_user();
+                            let detail = if detail_parts.is_empty() {
+                                "dispatch failure".to_string()
+                            } else {
+                                format!("dispatch failure ({})", detail_parts.join(", "))
+                            };
+
+                            (retryable, detail)
+                        }
+                        SdkError::TimeoutError(_) => (true, "timeout error".to_string()),
+                        SdkError::ResponseError(_) => (true, "response parsing error".to_string()),
+                        SdkError::ServiceError(service_err) => {
+                            use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+                            let status = service_err.raw().status();
+                            let code = service_err.err().code();
+                            let message = service_err.err().message();
+                            let retryable = status.is_server_error()
+                                || status.as_u16() == 429
+                                || matches!(
+                                    code,
+                                    Some("SlowDown")
+                                        | Some("RequestTimeout")
+                                        | Some("Throttling")
+                                        | Some("InternalError")
+                                );
+
+                            let mut detail = format!("service error (status {})", status);
+                            if let Some(code) = code {
+                                detail.push_str(&format!(" code {}", code));
+                            }
+                            if let Some(message) = message {
+                                detail.push_str(&format!(" message {}", message));
+                            }
+
+                            (retryable, detail)
+                        }
+                        SdkError::ConstructionFailure(_) => {
+                            (false, "request construction failure".to_string())
+                        }
+                        other => (false, format!("unhandled error: {other:?}")),
+                    };
+                    if attempt == MAX_ATTEMPTS || !retryable {
+                        return Err(format!(
+                            "PutObject versioned with attributes {} -> {} failed after {} attempts: {}",
+                            object_key, bucket_name, attempt, detail
+                        )
+                        .into());
+                    }
+
+                    let backoff_ms = INITIAL_BACKOFF_MS * (1u64 << (attempt - 1));
+                    println!(
+                        "Versioned upload with attributes attempt {} for {} failed: {}; retrying in {} ms",
+                        attempt, object_key, detail, backoff_ms
+                    );
+                    sleep(Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+
+        Err("Versioned upload with attributes failed after all attempts".into())
+    }
 }
 
 /// Test bucket manager for creating and cleaning up test buckets
@@ -660,6 +1277,57 @@ impl TestBucketManager {
             "[{}] Test buckets ready: source={}, destination={}",
             test_name, src_bucket, dst_bucket
         );
+        Ok((src_bucket, dst_bucket))
+    }
+
+    /// Create versioned test buckets (source and destination with versioning enabled)
+    pub async fn create_versioned_test_buckets(
+        &mut self,
+        test_name: &str,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        println!("[{}] Preparing versioned test buckets", test_name);
+        let (src_bucket, dst_bucket) = self.create_test_buckets(test_name).await?;
+
+        // Enable versioning on source bucket
+        println!("[{}] Enabling versioning on source bucket", test_name);
+        self.source_client
+            .enable_bucket_versioning(&src_bucket)
+            .await?;
+
+        // Enable versioning on destination bucket
+        println!("[{}] Enabling versioning on destination bucket", test_name);
+        self.dest_client
+            .enable_bucket_versioning(&dst_bucket)
+            .await?;
+
+        // Verify versioning is enabled
+        let src_versioning = self
+            .source_client
+            .get_bucket_versioning(&src_bucket)
+            .await?;
+        let dst_versioning = self.dest_client.get_bucket_versioning(&dst_bucket).await?;
+
+        if src_versioning != aws_sdk_s3::types::BucketVersioningStatus::Enabled {
+            return Err(format!(
+                "Failed to enable versioning on source bucket: {:?}",
+                src_versioning
+            )
+            .into());
+        }
+
+        if dst_versioning != aws_sdk_s3::types::BucketVersioningStatus::Enabled {
+            return Err(format!(
+                "Failed to enable versioning on destination bucket: {:?}",
+                dst_versioning
+            )
+            .into());
+        }
+
+        println!(
+            "[{}] Versioning enabled on both buckets: source={}, destination={}",
+            test_name, src_bucket, dst_bucket
+        );
+
         Ok((src_bucket, dst_bucket))
     }
 

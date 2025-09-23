@@ -77,7 +77,7 @@ async fn test_end_to_end_migration_scenario() -> Result<(), Box<dyn std::error::
             .await?;
     }
 
-    let migration_result = run_basic_migration(
+    let (first_run, second_run) = run_basic_migration(
         &config,
         &src_bucket,
         &dst_bucket,
@@ -86,10 +86,18 @@ async fn test_end_to_end_migration_scenario() -> Result<(), Box<dyn std::error::
     )
     .await?;
 
-    if !migration_result.success() {
+    if !first_run.success() {
         return Err(format!(
-            "Migration CLI failed with exit code: {}",
-            migration_result.code().unwrap_or(-1)
+            "First migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        return Err(format!(
+            "Second migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
         )
         .into());
     }
@@ -127,6 +135,14 @@ async fn test_end_to_end_migration_scenario() -> Result<(), Box<dyn std::error::
             .into());
         }
     }
+
+    // Verify idempotency
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second migration run should sync 0 files (idempotency check), but got: {:?}",
+        second_run.files_to_sync
+    );
 
     bucket_manager.cleanup().await?;
     file_generator.cleanup()?;
@@ -208,7 +224,7 @@ async fn test_pagination_handles_large_list() -> Result<(), Box<dyn std::error::
         return Err("Source bucket does not have the expected number of files".into());
     }
 
-    let migration_result = run_migration_with_max_keys(
+    let (first_run, second_run) = run_migration_with_max_keys(
         &config,
         &src_bucket,
         &dst_bucket,
@@ -218,10 +234,18 @@ async fn test_pagination_handles_large_list() -> Result<(), Box<dyn std::error::
     )
     .await?;
 
-    if !migration_result.success() {
+    if !first_run.success() {
         return Err(format!(
-            "Pagination regression migration failed with exit code: {}",
-            migration_result.code().unwrap_or(-1)
+            "First pagination migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        return Err(format!(
+            "Second pagination migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
         )
         .into());
     }
@@ -249,6 +273,14 @@ async fn test_pagination_handles_large_list() -> Result<(), Box<dyn std::error::
     {
         return Err("Not all objects were migrated successfully".into());
     }
+
+    // Verify idempotency
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second migration run should sync 0 files (idempotency check), but got: {:?}",
+        second_run.files_to_sync
+    );
 
     bucket_manager.cleanup().await?;
     file_generator.cleanup()?;
@@ -317,8 +349,8 @@ async fn test_unicode_and_special_character_files() -> Result<(), Box<dyn std::e
     println!("✓ All {} files uploaded successfully", test_files.len());
 
     println!("\n=== Running Migration ===");
-    // Run migration
-    let migration_result = run_basic_migration(
+    // Run migration - runs TWICE for idempotency testing
+    let (first_run, second_run) = run_basic_migration(
         &config,
         &src_bucket,
         &dst_bucket,
@@ -327,10 +359,18 @@ async fn test_unicode_and_special_character_files() -> Result<(), Box<dyn std::e
     )
     .await?;
 
-    if !migration_result.success() {
+    if !first_run.success() {
         return Err(format!(
-            "Migration CLI failed with exit code: {}",
-            migration_result.code().unwrap_or(-1)
+            "First migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        return Err(format!(
+            "Second migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
         )
         .into());
     }
@@ -373,6 +413,14 @@ async fn test_unicode_and_special_character_files() -> Result<(), Box<dyn std::e
     println!(
         "✓ All {} Unicode/special character files verified successfully",
         test_files.len()
+    );
+
+    // Verify idempotency
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second migration run should sync 0 files (idempotency check), but got: {:?}",
+        second_run.files_to_sync
     );
 
     // Cleanup

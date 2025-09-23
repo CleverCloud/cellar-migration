@@ -161,8 +161,8 @@ async fn test_dry_run_when_already_synced() -> Result<(), Box<dyn std::error::Er
         .into());
     }
 
-    // Run execute migration - should be a no-op
-    let execute_result = run_basic_migration(
+    // Run execute migration - should be a no-op, runs TWICE for idempotency
+    let (first_run, second_run) = run_basic_migration(
         &config,
         &src_bucket,
         &dst_bucket,
@@ -171,10 +171,18 @@ async fn test_dry_run_when_already_synced() -> Result<(), Box<dyn std::error::Er
     )
     .await?;
 
-    if !execute_result.success() {
+    if !first_run.success() {
         return Err(format!(
-            "Execute migration CLI failed with exit code: {}",
-            execute_result.code().unwrap_or(-1)
+            "First execute migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        return Err(format!(
+            "Second execute migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
         )
         .into());
     }
@@ -190,6 +198,21 @@ async fn test_dry_run_when_already_synced() -> Result<(), Box<dyn std::error::Er
     {
         return Err("Buckets should remain in sync after no-op migration".into());
     }
+
+    // Verify idempotency - both runs should sync 0 files
+    assert_eq!(
+        first_run.files_to_sync,
+        Some(0),
+        "First run should sync 0 files (already synced), but got: {:?}",
+        first_run.files_to_sync
+    );
+
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second run should sync 0 files (idempotency check), but got: {:?}",
+        second_run.files_to_sync
+    );
 
     // Cleanup
     bucket_manager.cleanup().await?;

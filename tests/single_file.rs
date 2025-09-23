@@ -74,8 +74,8 @@ async fn run_single_file_migration(
         .upload_test_file(&src_bucket, &test_file, &file_path)
         .await?;
 
-    // Run migration using the CLI
-    let migration_result = run_basic_migration(
+    // Run migration using the CLI - runs TWICE for idempotency testing
+    let (first_run, second_run) = run_basic_migration(
         config,
         &src_bucket,
         &dst_bucket,
@@ -84,10 +84,18 @@ async fn run_single_file_migration(
     )
     .await?;
 
-    if !migration_result.success() {
+    if !first_run.success() {
         return Err(format!(
-            "Migration CLI failed with exit code: {}",
-            migration_result.code().unwrap_or(-1)
+            "First migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        return Err(format!(
+            "Second migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
         )
         .into());
     }
@@ -126,6 +134,15 @@ async fn run_single_file_migration(
         return Err("Not all objects were migrated successfully".into());
     }
 
+    // NOW verify idempotency: second run should have synced 0 files
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second migration run should sync 0 files (idempotency check), but got: {:?}\nStderr: {}",
+        second_run.files_to_sync,
+        second_run.stderr
+    );
+
     // Cleanup
     bucket_manager.cleanup().await?;
 
@@ -157,13 +174,21 @@ where
         .upload_test_file(&src_bucket, &test_file, &file_path)
         .await?;
 
-    let migration_result =
+    let (first_run, second_run) =
         run_basic_migration(config, &src_bucket, &dst_bucket, 10, num_cpus::get()).await?;
 
-    if !migration_result.success() {
+    if !first_run.success() {
         return Err(format!(
-            "Migration CLI failed with exit code: {}",
-            migration_result.code().unwrap_or(-1)
+            "First migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        return Err(format!(
+            "Second migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
         )
         .into());
     }
@@ -188,6 +213,14 @@ where
         )
         .into());
     }
+
+    // Verify idempotency
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second migration run should sync 0 files (idempotency check), but got: {:?}",
+        second_run.files_to_sync
+    );
 
     bucket_manager.cleanup().await?;
 
@@ -386,13 +419,21 @@ async fn test_preserves_acl() -> Result<(), Box<dyn std::error::Error>> {
         .upload_test_file(&src_bucket, &test_file, &file_path)
         .await?;
 
-    let migration_result =
+    let (first_run, second_run) =
         run_basic_migration(&config, &src_bucket, &dst_bucket, 10, num_cpus::get()).await?;
 
-    if !migration_result.success() {
+    if !first_run.success() {
         return Err(format!(
-            "Migration CLI failed with exit code: {}",
-            migration_result.code().unwrap_or(-1)
+            "First migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        return Err(format!(
+            "Second migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
         )
         .into());
     }
@@ -413,6 +454,14 @@ async fn test_preserves_acl() -> Result<(), Box<dyn std::error::Error>> {
         VerificationResult::Match,
         verification_result,
         "ACL propagation should preserve public-read flag"
+    );
+
+    // Verify idempotency
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second migration run should sync 0 files (idempotency check), but got: {:?}",
+        second_run.files_to_sync
     );
 
     bucket_manager.cleanup().await?;
@@ -467,8 +516,8 @@ async fn test_multipart_upload_behavior() -> Result<(), Box<dyn std::error::Erro
         .upload_test_file(&src_bucket, &test_file, &file_path)
         .await?;
 
-    // Run migration with small chunk size to force multipart
-    let migration_result = run_basic_migration(
+    // Run migration with small chunk size to force multipart - runs TWICE for idempotency
+    let (first_run, second_run) = run_basic_migration(
         &config,
         &src_bucket,
         &dst_bucket,
@@ -477,10 +526,18 @@ async fn test_multipart_upload_behavior() -> Result<(), Box<dyn std::error::Erro
     )
     .await?;
 
-    if !migration_result.success() {
+    if !first_run.success() {
         return Err(format!(
-            "Migration CLI failed with exit code: {}",
-            migration_result.code().unwrap_or(-1)
+            "First migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        return Err(format!(
+            "Second migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
         )
         .into());
     }
@@ -506,6 +563,14 @@ async fn test_multipart_upload_behavior() -> Result<(), Box<dyn std::error::Erro
         )
         .into());
     }
+
+    // Verify idempotency
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second migration run should sync 0 files (idempotency check), but got: {:?}",
+        second_run.files_to_sync
+    );
 
     // Cleanup
     bucket_manager.cleanup().await?;

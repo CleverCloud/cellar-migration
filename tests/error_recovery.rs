@@ -108,8 +108,8 @@ async fn test_nonexistent_source_bucket() -> Result<(), Box<dyn std::error::Erro
             .as_millis()
     );
 
-    // Run migration with nonexistent source bucket
-    let migration_result = run_basic_migration(
+    // Run migration with nonexistent source bucket - it runs twice but we expect both to fail
+    let (first_run, second_run) = run_basic_migration(
         &config,
         &nonexistent_src_bucket,
         &dst_bucket,
@@ -119,8 +119,14 @@ async fn test_nonexistent_source_bucket() -> Result<(), Box<dyn std::error::Erro
     .await?;
 
     // Should fail gracefully with bucket not found error
-    if migration_result.success() {
-        return Err("Migration should have failed with nonexistent source bucket".into());
+    if first_run.success() {
+        return Err("First migration run should have failed with nonexistent source bucket".into());
+    }
+
+    if second_run.success() {
+        return Err(
+            "Second migration run should have failed with nonexistent source bucket".into(),
+        );
     }
 
     // Cleanup
@@ -182,8 +188,8 @@ async fn test_bucket_creation_on_missing_destination() -> Result<(), Box<dyn std
             .as_millis()
     );
 
-    // Run migration - should auto-create destination bucket
-    let migration_result = run_basic_migration(
+    // Run migration - should auto-create destination bucket, runs TWICE for idempotency
+    let (first_run, second_run) = run_basic_migration(
         &config,
         &src_bucket,
         &nonexistent_dst_bucket,
@@ -192,10 +198,18 @@ async fn test_bucket_creation_on_missing_destination() -> Result<(), Box<dyn std
     )
     .await?;
 
-    if !migration_result.success() {
+    if !first_run.success() {
         return Err(format!(
-            "Migration with bucket auto-creation failed with exit code: {}",
-            migration_result.code().unwrap_or(-1)
+            "First migration run with bucket auto-creation failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        return Err(format!(
+            "Second migration run with bucket auto-creation failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
         )
         .into());
     }
@@ -213,6 +227,14 @@ async fn test_bucket_creation_on_missing_destination() -> Result<(), Box<dyn std
     if dest_objects.len() != 1 {
         return Err("File was not migrated to auto-created bucket".into());
     }
+
+    // Verify idempotency
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second migration run should sync 0 files (idempotency check), but got: {:?}",
+        second_run.files_to_sync
+    );
 
     // Manual cleanup of auto-created bucket
     let _ = dest_client.delete_bucket(&nonexistent_dst_bucket).await;
@@ -258,8 +280,8 @@ async fn test_empty_bucket_handling() -> Result<(), Box<dyn std::error::Error>> 
 
     // Don't upload any files - test empty bucket migration
 
-    // Run migration on empty source bucket
-    let migration_result = run_basic_migration(
+    // Run migration on empty source bucket - runs TWICE for idempotency
+    let (first_run, second_run) = run_basic_migration(
         &config,
         &src_bucket,
         &dst_bucket,
@@ -268,10 +290,18 @@ async fn test_empty_bucket_handling() -> Result<(), Box<dyn std::error::Error>> 
     )
     .await?;
 
-    if !migration_result.success() {
+    if !first_run.success() {
         return Err(format!(
-            "Empty bucket migration failed with exit code: {}",
-            migration_result.code().unwrap_or(-1)
+            "First empty bucket migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        return Err(format!(
+            "Second empty bucket migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
         )
         .into());
     }
@@ -285,6 +315,21 @@ async fn test_empty_bucket_handling() -> Result<(), Box<dyn std::error::Error>> 
     if !dest_objects.is_empty() {
         return Err("Destination bucket should be empty after migrating empty source".into());
     }
+
+    // Verify idempotency - both runs should sync 0 files
+    assert_eq!(
+        first_run.files_to_sync,
+        Some(0),
+        "First run should sync 0 files (empty bucket), but got: {:?}",
+        first_run.files_to_sync
+    );
+
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second run should sync 0 files (idempotency check), but got: {:?}",
+        second_run.files_to_sync
+    );
 
     // Cleanup
     bucket_manager.cleanup().await?;

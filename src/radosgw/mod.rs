@@ -21,11 +21,15 @@ use aws_sdk_s3::{
         get_object::{GetObjectError, GetObjectOutput},
         get_object_acl::{GetObjectAclError, GetObjectAclOutput},
         head_object::HeadObjectOutput,
+        list_object_versions::ListObjectVersionsOutput,
         put_object::{PutObjectError, PutObjectOutput},
         upload_part::{UploadPartError, UploadPartOutput},
     },
     primitives::ByteStream,
-    types::{Bucket, CompletedMultipartUpload, CompletedPart, Permission},
+    types::{
+        Bucket, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Permission,
+        VersioningConfiguration,
+    },
 };
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_types_convert::date_time::DateTimeExt;
@@ -118,9 +122,10 @@ impl RadosGW {
 
         let sdk_config = sdk_config.build();
         debug!("sdk_config: {:?}", sdk_config);
+        #[allow(deprecated)]
         let config = aws_sdk_s3::config::Builder::from(&sdk_config)
             .credentials_provider(creds)
-            .behavior_version(BehaviorVersion::v2023_11_09())
+            .behavior_version(BehaviorVersion::v2024_03_28())
             .request_checksum_calculation(
                 aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
             )
@@ -332,6 +337,47 @@ impl RadosGW {
         return Ok(objects);
     }
 
+    #[instrument(skip(self), level = "trace")]
+    async fn list_object_versions_page(
+        &self,
+        max_results: Option<i32>,
+        key_marker: Option<String>,
+        version_id_marker: Option<String>,
+    ) -> anyhow::Result<ListObjectVersionsOutput> {
+        event!(
+            Level::TRACE,
+            "Sending ListObjectVersions request: bucket={:?}, key_marker={:?}, version_id_marker={:?}, max_keys={:?}",
+            self.bucket,
+            key_marker,
+            version_id_marker,
+            max_results
+        );
+
+        let result = self
+            .client
+            .list_object_versions()
+            .bucket(
+                self.bucket
+                    .clone()
+                    .expect("list_object_versions should have a bucket"),
+            )
+            .set_key_marker(key_marker)
+            .set_version_id_marker(version_id_marker)
+            .set_max_keys(max_results)
+            .send()
+            .await;
+
+        let output = result.map_err(anyhow::Error::from)?;
+
+        event!(
+            Level::TRACE,
+            "ListObjectVersions result: is_truncated={:?}",
+            output.is_truncated
+        );
+
+        Ok(output)
+    }
+
     #[instrument(skip(self), level = "debug")]
     pub async fn delete_object(
         &self,
@@ -375,27 +421,51 @@ impl RadosGW {
             .map(|_| ())
     }
     #[instrument(skip(self), level = "debug")]
-    pub async fn head_object_metadata(
+    async fn fetch_object_metadata(
         &self,
         object: &ProviderObject,
+        version_id: Option<&str>,
     ) -> anyhow::Result<HeadObjectOutput> {
-        self.client
+        let mut request = self
+            .client
             .head_object()
             .bucket(
                 self.bucket
                     .clone()
                     .expect("head_object_metadata should have a bucket"),
             )
-            .key(object.get_key())
-            .send()
-            .await
-            .map_err(|error| {
-                anyhow!(
-                    "Error fetching object metadata {}: {:?}",
-                    object.get_key(),
-                    error
-                )
-            })
+            .key(object.get_key());
+
+        if let Some(version_id) = version_id {
+            request = request.version_id(version_id.to_string());
+        }
+
+        request.send().await.map_err(|error| {
+            anyhow!(
+                "Error fetching object metadata {}: {:?}",
+                object.get_key(),
+                error
+            )
+        })
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    pub async fn head_object_metadata(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<HeadObjectOutput> {
+        self.fetch_object_metadata(object, None).await
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    pub async fn head_object_version_metadata(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<HeadObjectOutput> {
+        let version_id = object
+            .version_id()
+            .expect("Versioned object should provide a version id");
+        self.fetch_object_metadata(object, Some(version_id)).await
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -416,18 +486,46 @@ impl RadosGW {
     }
 
     #[instrument(skip(self), level = "debug")]
-    pub async fn get_object(&self, object: &ProviderObject) -> anyhow::Result<GetObjectOutput> {
-        self.client
+    #[instrument(skip(self), level = "debug")]
+    async fn fetch_object(
+        &self,
+        object: &ProviderObject,
+        version_id: Option<&str>,
+    ) -> anyhow::Result<GetObjectOutput> {
+        let mut request = self
+            .client
             .get_object()
             .bucket(
                 self.bucket
                     .clone()
                     .expect("get_object should have a bucket"),
             )
-            .key(object.get_key())
+            .key(object.get_key());
+
+        if let Some(version_id) = version_id {
+            request = request.version_id(version_id.to_string());
+        }
+
+        request
             .send()
             .await
             .map_err(|error| anyhow!("Error fetching object {}: {:?}", object.get_key(), error))
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_object(&self, object: &ProviderObject) -> anyhow::Result<GetObjectOutput> {
+        self.fetch_object(object, None).await
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_object_version(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<GetObjectOutput> {
+        let version_id = object
+            .version_id()
+            .expect("Versioned object should provide a version id");
+        self.fetch_object(object, Some(version_id)).await
     }
 }
 
@@ -592,6 +690,88 @@ impl Provider for RadosGW {
             },
         ))
     }
+
+    #[instrument(skip(self), level = "debug")]
+    fn list_object_versions(
+        &self,
+        max_keys: Option<usize>,
+        start_after: Option<String>,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<Vec<ProviderObject>>> + '_>> {
+        Box::pin(futures::stream::unfold(
+            Some((start_after, None, 0usize)),
+            move |state| async move {
+                let (key_marker, version_id_marker, total_keys) = match state {
+                    Some(state) => state,
+                    None => return None,
+                };
+
+                let remaining = max_keys.and_then(|max| max.checked_sub(total_keys));
+                if let Some(0) = remaining {
+                    return None;
+                }
+
+                let max_results = remaining
+                    .map(|remaining| remaining.min(MAX_FETCH_KEYS))
+                    .unwrap_or(MAX_FETCH_KEYS) as i32;
+
+                event!(
+                    Level::DEBUG,
+                    "Listing object versions (bucket={:?}): key_marker={:?}, version_id_marker={:?}, max_results={}, total_keys={}",
+                    self.bucket,
+                    key_marker,
+                    version_id_marker,
+                    max_results,
+                    total_keys
+                );
+
+                let output = self
+                    .list_object_versions_page(
+                        Some(max_results),
+                        key_marker.clone(),
+                        version_id_marker.clone(),
+                    )
+                    .await;
+
+                match output {
+                    Ok(output) => {
+                        let objects: Vec<ProviderObject> = output
+                            .versions()
+                            .iter()
+                            .map(ProviderObject::from_version_record)
+                            .collect();
+
+                        event!(
+                            Level::DEBUG,
+                            "Listing object versions (bucket={:?}): fetched len={}",
+                            self.bucket,
+                            objects.len()
+                        );
+
+                        let is_truncated = output.is_truncated.unwrap_or(false);
+                        let next_state = if is_truncated {
+                            Some((
+                                output.next_key_marker().map(|s| s.to_string()),
+                                output.next_version_id_marker().map(|s| s.to_string()),
+                                total_keys + objects.len(),
+                            ))
+                        } else {
+                            None
+                        };
+
+                        if objects.is_empty() && next_state.is_none() {
+                            None
+                        } else {
+                            Some((Ok(objects), next_state))
+                        }
+                    }
+                    Err(error) => Some((
+                        Err(error),
+                        Some((key_marker, version_id_marker, total_keys)),
+                    )),
+                }
+            },
+        ))
+    }
     async fn get_object_metadata(
         &self,
         object: &ProviderObject,
@@ -620,14 +800,93 @@ impl Provider for RadosGW {
 
         Ok(metadata)
     }
+
+    async fn get_object_version_metadata(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<ProviderObjectMetadata> {
+        let (head_result, acl_result) = tokio::join!(
+            self.head_object_version_metadata(object),
+            self.get_object_acl(object)
+        );
+
+        let mut metadata: ProviderObjectMetadata = head_result?.into();
+
+        match acl_result {
+            Ok(acl) => {
+                metadata.acl_public = acl_has_public_read(&acl);
+            }
+            Err(error) => {
+                event!(
+                    Level::WARN,
+                    "Failed to fetch ACL for object {}: {:?}. Defaulting to private ACL.",
+                    object.get_key(),
+                    error
+                );
+                metadata.acl_public = false;
+            }
+        }
+
+        Ok(metadata)
+    }
     async fn get_object(
         &self,
         object: &ProviderObject,
     ) -> anyhow::Result<Box<dyn ProviderResponse>> {
-        let object = self.get_object(object).await;
+        let object = RadosGW::get_object(self, object).await;
 
         let x: Box<dyn ProviderResponse> = Box::new(RadosGWResponse::new(object));
         Ok(x)
+    }
+
+    async fn get_object_version(
+        &self,
+        object: &ProviderObject,
+    ) -> anyhow::Result<Box<dyn ProviderResponse>> {
+        let object = RadosGW::get_object_version(self, object).await;
+
+        let x: Box<dyn ProviderResponse> = Box::new(RadosGWResponse::new(object));
+        Ok(x)
+    }
+
+    async fn is_bucket_versioned(&self) -> anyhow::Result<bool> {
+        let bucket = self
+            .bucket
+            .clone()
+            .expect("is_bucket_versioned should have a bucket");
+
+        let output = self
+            .client
+            .get_bucket_versioning()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(anyhow::Error::from)?;
+
+        Ok(matches!(
+            output.status(),
+            Some(BucketVersioningStatus::Enabled)
+        ))
+    }
+
+    async fn enable_bucket_versioning(&self) -> anyhow::Result<()> {
+        let bucket = self
+            .bucket
+            .clone()
+            .expect("enable_bucket_versioning should have a bucket");
+
+        self.client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
     }
 }
 

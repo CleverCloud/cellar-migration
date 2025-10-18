@@ -403,13 +403,26 @@ impl RadosGW {
     pub async fn create_delete_marker(
         &self,
         key: &str,
-        version_id: &str,
+        version_id: Option<&str>,
         last_modified: Option<&DateTime<Utc>>,
     ) -> anyhow::Result<()> {
-        let bucket = self
+        let bucket_name = self
             .bucket
             .clone()
             .expect("create_delete_marker should have a bucket");
+
+        if version_id.is_none() {
+            self.client
+                .delete_object()
+                .bucket(bucket_name.clone())
+                .key(key.to_string())
+                .send()
+                .await
+                .map_err(anyhow::Error::from)?;
+            return Ok(());
+        }
+
+        let version_id = version_id.unwrap();
 
         let version_param = encode(version_id).into_owned();
         let last_modified_encoded = last_modified.map(|timestamp| {
@@ -420,7 +433,7 @@ impl RadosGW {
         let mut operation = self
             .client
             .delete_object()
-            .bucket(bucket)
+            .bucket(bucket_name)
             .key(key.to_string())
             .customize();
 

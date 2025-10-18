@@ -90,12 +90,14 @@ async fn test_simple_versioned_object_migration() -> Result<(), Box<dyn std::err
 
     // Run migration using the CLI - runs TWICE for idempotency testing
     println!("[{}] Running migration with version support", test_name);
-    let (first_run, second_run) = run_basic_migration(
+    let (first_run, second_run) = run_basic_migration_with_flags(
         &config,
         &src_bucket,
         &dst_bucket,
         5,               // 5MB chunks (forces multipart for 150MB file)
         num_cpus::get(), // Use all available CPUs
+        true,
+        true,
     )
     .await?;
 
@@ -228,8 +230,16 @@ async fn test_version_order_preserved() -> Result<(), Box<dyn std::error::Error>
     )
     .await?;
 
-    let (first_run, second_run) =
-        run_basic_migration(&config, &src_bucket, &dst_bucket, 5, num_cpus::get()).await?;
+    let (first_run, second_run) = run_basic_migration_with_flags(
+        &config,
+        &src_bucket,
+        &dst_bucket,
+        5,
+        num_cpus::get(),
+        true,
+        true,
+    )
+    .await?;
 
     if !first_run.success() {
         bucket_manager.cleanup().await?;
@@ -410,8 +420,16 @@ async fn test_delete_markers_preserved() -> Result<(), Box<dyn std::error::Error
         };
     }
 
-    let (first_run, second_run) =
-        run_basic_migration(&config, &src_bucket, &dst_bucket, 5, num_cpus::get()).await?;
+    let (first_run, second_run) = run_basic_migration_with_flags(
+        &config,
+        &src_bucket,
+        &dst_bucket,
+        5,
+        num_cpus::get(),
+        true,
+        true,
+    )
+    .await?;
 
     if !first_run.success() {
         bucket_manager.cleanup().await?;
@@ -581,8 +599,16 @@ async fn test_versioned_acl_preserved() -> Result<(), Box<dyn std::error::Error>
     .await?;
 
     // Run migration twice for idempotency
-    let (first_run, second_run) =
-        run_basic_migration(&config, &src_bucket, &dst_bucket, 5, num_cpus::get()).await?;
+    let (first_run, second_run) = run_basic_migration_with_flags(
+        &config,
+        &src_bucket,
+        &dst_bucket,
+        5,
+        num_cpus::get(),
+        true,
+        true,
+    )
+    .await?;
 
     if !first_run.success() {
         bucket_manager.cleanup().await?;
@@ -790,12 +816,14 @@ async fn test_complex_versioned_object_migration() -> Result<(), Box<dyn std::er
     );
 
     let migration_start = std::time::Instant::now();
-    let (first_run, second_run) = run_basic_migration(
+    let (first_run, second_run) = run_basic_migration_with_flags(
         &config,
         &src_bucket,
         &dst_bucket,
         10,              // 10MB chunks
         num_cpus::get(), // Use all available CPUs
+        true,
+        true,
     )
     .await?;
 
@@ -1741,12 +1769,14 @@ async fn test_versioned_migration_with_custom_attributes() -> Result<(), Box<dyn
     );
 
     let migration_start = std::time::Instant::now();
-    let (first_run, second_run) = run_basic_migration(
+    let (first_run, second_run) = run_basic_migration_with_flags(
         &config,
         &src_bucket,
         &dst_bucket,
         5,               // 5MB chunks (forces multipart for larger files)
         num_cpus::get(), // Use all available CPUs
+        true,
+        true,
     )
     .await?;
 

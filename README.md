@@ -52,6 +52,13 @@ You can also configure the multipart chunk size if needed, by default it is 100M
 A `--delete` option exists to delete files on the remote bucket that are not on the source bucket. Be careful: if your bucket already had files before a first synchronization, then
 those file will probably end up being deleted.
 
+### Versioned Bucket Migration Options
+
+When migrating versioned buckets, two additional flags are available:
+
+- `--preserve-version-ids`: Preserves the existing S3 version IDs when migrating versioned objects. This ensures that version IDs remain consistent between source and destination buckets.
+- `--preserve-last-modified-timestamps`: Preserves the original Last-Modified timestamps during migration, including for delete markers. This maintains the exact temporal metadata from the source bucket.
+
 ## 💡☁️ Running this tool on Clever Cloud
 
 ![Clever Cloud logo](/assets/logo.png)

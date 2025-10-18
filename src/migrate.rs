@@ -74,6 +74,8 @@ pub struct BucketMigrationConfiguration {
     pub chunk_size: usize,
     pub sync_threads: usize,
     pub dry_run: bool,
+    pub preserve_version_ids: bool,
+    pub preserve_last_modified_timestamps: bool,
 }
 
 pub enum BucketObjectsMigrationResult {
@@ -142,6 +144,8 @@ async fn migrate_objects(
                 objects_to_delete,
                 conf.sync_threads,
                 conf.chunk_size,
+                conf.preserve_version_ids,
+                conf.preserve_last_modified_timestamps,
             );
             let results = uploader.sync().await;
             BucketObjectsMigrationResult::Executed(results)
@@ -321,13 +325,13 @@ pub async fn migrate_bucket(
     let source_objects = collect_bucket_objects(
         source_listing_provider.as_ref(),
         source_is_versioned,
-        source_is_versioned,
+        source_is_versioned && conf.preserve_version_ids,
     )
     .await?;
     let dest_objects = match collect_bucket_objects(
         dest_listing_provider.as_ref(),
         dest_use_versions,
-        source_is_versioned,
+        source_is_versioned && conf.preserve_version_ids,
     )
     .await
     {

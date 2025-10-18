@@ -62,6 +62,8 @@ pub struct Uploader {
     multipart_chunk_size: usize,
     total_objects: usize,
     total_objects_to_delete: usize,
+    preserve_version_ids: bool,
+    preserve_last_modified_timestamps: bool,
 }
 
 impl Uploader {
@@ -72,6 +74,8 @@ impl Uploader {
         objects_to_delete: Vec<ProviderObject>,
         threads: usize,
         multipart_chunk_size: usize,
+        preserve_version_ids: bool,
+        preserve_last_modified_timestamps: bool,
     ) -> Uploader {
         let total_objects = objects.len();
         let total_objects_to_delete = objects_to_delete.len();
@@ -97,6 +101,8 @@ impl Uploader {
             multipart_chunk_size,
             total_objects,
             total_objects_to_delete,
+            preserve_version_ids,
+            preserve_last_modified_timestamps,
         }
     }
 
@@ -110,6 +116,8 @@ impl Uploader {
         let mut handles = Vec::new();
         let total_files = self.total_objects;
         let total_files_to_delete = self.total_objects_to_delete;
+        let preserve_version_ids = self.preserve_version_ids;
+        let preserve_last_modified_timestamps = self.preserve_last_modified_timestamps;
 
         let processed_sync = Arc::new(AtomicUsize::new(0));
         let processed_delete = Arc::new(AtomicUsize::new(0));
@@ -122,6 +130,8 @@ impl Uploader {
             let multipart_chunk_size = self.multipart_chunk_size;
             let processed_sync = processed_sync.clone();
             let processed_delete = processed_delete.clone();
+            let preserve_version_ids = preserve_version_ids;
+            let preserve_last_modified_timestamps = preserve_last_modified_timestamps;
 
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
@@ -169,6 +179,8 @@ impl Uploader {
                                 &object,
                                 thread_id,
                                 multipart_chunk_size,
+                                preserve_version_ids,
+                                preserve_last_modified_timestamps,
                             )
                             .await
                             .map(|_| object.get_size() as usize);
@@ -263,9 +275,18 @@ impl Uploader {
         object: &ProviderObject,
         thread_id: usize,
         multipart_chunk_size: usize,
+        preserve_version_ids: bool,
+        preserve_last_modified_timestamps: bool,
     ) -> anyhow::Result<()> {
         if object.is_delete_marker() {
-            return Uploader::sync_delete_marker(radosgw_client, object, thread_id).await;
+            return Uploader::sync_delete_marker(
+                radosgw_client,
+                object,
+                thread_id,
+                preserve_version_ids,
+                preserve_last_modified_timestamps,
+            )
+            .await;
         }
 
         let (mut object_metadata, mut response) = if let Some(_version_id) = object.version_id() {
@@ -285,10 +306,12 @@ impl Uploader {
             (metadata, response)
         };
 
-        if let Some(version_id) = object.version_id() {
-            object_metadata
-                .user_metadata
-                .insert("cc-version-id".to_string(), version_id.to_string());
+        if preserve_version_ids {
+            if let Some(version_id) = object.version_id() {
+                object_metadata
+                    .user_metadata
+                    .insert("cc-version-id".to_string(), version_id.to_string());
+            }
         }
 
         if response.success() {
@@ -356,25 +379,38 @@ impl Uploader {
         radosgw_client: &RadosGW,
         object: &ProviderObject,
         thread_id: usize,
+        preserve_version_ids: bool,
+        preserve_last_modified_timestamps: bool,
     ) -> anyhow::Result<()> {
-        let version_id = object.version_id().ok_or_else(|| {
-            anyhow!(
-                "Delete marker is missing a version id for {}",
-                object.get_key()
-            )
-        })?;
-        let last_modified = object.get_last_modified();
+        let original_version_id = object.version_id();
+
+        let version_id = if preserve_version_ids {
+            Some(original_version_id.ok_or_else(|| {
+                anyhow!(
+                    "Delete marker is missing a version id for {}",
+                    object.get_key()
+                )
+            })?)
+        } else {
+            None
+        };
+        let last_modified = if preserve_last_modified_timestamps {
+            Some(object.get_last_modified())
+        } else {
+            None
+        };
 
         event!(
             Level::INFO,
-            "Thread {} | Creating delete marker for {} (version {})",
+            "Thread {} | Creating delete marker for {} (version {:?}, last_modified {:?})",
             thread_id,
             object.get_key(),
-            version_id
+            original_version_id,
+            last_modified
         );
 
         radosgw_client
-            .create_delete_marker(object.key(), version_id, Some(last_modified))
+            .create_delete_marker(object.key(), version_id, last_modified)
             .await
     }
 

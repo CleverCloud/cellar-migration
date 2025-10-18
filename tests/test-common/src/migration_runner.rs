@@ -84,6 +84,8 @@ pub struct MigrationOptions {
     pub thread_count: usize,
     pub max_keys: Option<usize>,
     pub execute: bool,
+    pub preserve_version_ids: bool,
+    pub preserve_last_modified_timestamps: bool,
 }
 
 impl Default for MigrationOptions {
@@ -93,6 +95,8 @@ impl Default for MigrationOptions {
             thread_count: 4,
             max_keys: Some(1000),
             execute: true,
+            preserve_version_ids: false,
+            preserve_last_modified_timestamps: false,
         }
     }
 }
@@ -114,6 +118,16 @@ impl MigrationOptions {
 
     pub fn max_keys(mut self, max_keys: Option<usize>) -> Self {
         self.max_keys = max_keys;
+        self
+    }
+
+    pub fn preserve_version_ids(mut self, value: bool) -> Self {
+        self.preserve_version_ids = value;
+        self
+    }
+
+    pub fn preserve_last_modified_timestamps(mut self, value: bool) -> Self {
+        self.preserve_last_modified_timestamps = value;
         self
     }
 
@@ -170,6 +184,14 @@ pub async fn run_migration_cli(
 
     if options.execute {
         args.push("--execute".to_string());
+    }
+
+    if options.preserve_version_ids {
+        args.push("--preserve-version-ids".to_string());
+    }
+
+    if options.preserve_last_modified_timestamps {
+        args.push("--preserve-last-modified-timestamps".to_string());
     }
 
     cmd.args(&args);
@@ -287,9 +309,33 @@ pub async fn run_basic_migration(
     chunk_size_mb: usize,
     thread_count: usize,
 ) -> Result<(MigrationResult, MigrationResult), Box<dyn std::error::Error>> {
+    run_basic_migration_with_flags(
+        config,
+        src_bucket,
+        dst_bucket,
+        chunk_size_mb,
+        thread_count,
+        false,
+        false,
+    )
+    .await
+}
+
+/// Convenience function for migration with preservation flags
+pub async fn run_basic_migration_with_flags(
+    config: &TestConfig,
+    src_bucket: &str,
+    dst_bucket: &str,
+    chunk_size_mb: usize,
+    thread_count: usize,
+    preserve_version_ids: bool,
+    preserve_last_modified_timestamps: bool,
+) -> Result<(MigrationResult, MigrationResult), Box<dyn std::error::Error>> {
     let options = MigrationOptions::new()
         .chunk_size_mb(chunk_size_mb)
-        .thread_count(thread_count);
+        .thread_count(thread_count)
+        .preserve_version_ids(preserve_version_ids)
+        .preserve_last_modified_timestamps(preserve_last_modified_timestamps);
 
     // First migration run
     let first_run = run_migration_cli(config, src_bucket, dst_bucket, options.clone()).await?;

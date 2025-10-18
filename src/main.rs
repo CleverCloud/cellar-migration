@@ -66,6 +66,18 @@ async fn main() -> anyhow::Result<()> {
                 .help("Define the maximum number of object keys to list when listing the bucket. Lowering this might help listing huge buckets")
                 .required(false).value_parser(value_parser!(usize)).default_value("1000")
             )
+            .arg(
+                Arg::new("preserve-version-ids")
+                    .long("preserve-version-ids")
+                    .help("Preserve existing S3 version IDs when migrating versioned objects")
+                    .action(ArgAction::SetTrue)
+            )
+            .arg(
+                Arg::new("preserve-last-modified-timestamps")
+                    .long("preserve-last-modified-timestamps")
+                    .help("Preserve original Last-Modified timestamps (including delete markers) during migration")
+                    .action(ArgAction::SetTrue)
+            )
             /* .arg(
                 Arg::new("delete").long("delete").short('d')
                 .help("Delete extraneous files from destination bucket")
@@ -104,6 +116,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
 
     //let delete_destination_files = params.get_one::<bool>("delete") == Some(&true);
     let delete_destination_files = false;
+    let preserve_version_ids = params.get_flag("preserve-version-ids");
+    let preserve_last_modified_timestamps = params.get_flag("preserve-last-modified-timestamps");
 
     let source_bucket: Option<String> = params
         .get_one("source-bucket")
@@ -270,6 +284,8 @@ async fn migrate_command(params: &ArgMatches) -> anyhow::Result<()> {
             chunk_size: multipart_upload_chunk_size,
             sync_threads,
             dry_run,
+            preserve_version_ids,
+            preserve_last_modified_timestamps,
         };
 
         event!(

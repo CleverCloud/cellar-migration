@@ -172,6 +172,130 @@ async fn test_simple_versioned_object_migration() -> Result<(), Box<dyn std::err
     }
 }
 
+/// Ensure version ordering is preserved for single-part and multi-part objects
+#[test]
+async fn test_version_order_preserved() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(e) = TestConfig::validate_env() {
+        return Err(format!(
+            "Environment validation failed: {}. Please set the required environment variables.",
+            e
+        )
+        .into());
+    }
+
+    let config = TestConfig::from_env()?;
+    let test_name = "version-order-migration";
+    let file_generator = FileGenerator::new_for_test(test_name)?;
+
+    let mut bucket_manager = TestBucketManager::new(config.clone()).await?;
+    let (src_bucket, dst_bucket) = bucket_manager
+        .create_versioned_test_buckets(test_name)
+        .await?;
+
+    let single_part_key = "ordered-single-part.txt";
+    let single_part_versions = create_ordered_versions(
+        &bucket_manager,
+        &file_generator,
+        &src_bucket,
+        single_part_key,
+        &[128_000, 130_000, 132_000],
+        test_name,
+    )
+    .await?;
+
+    let multi_part_key = "ordered-multi-part.bin";
+    let multi_part_versions = create_ordered_versions(
+        &bucket_manager,
+        &file_generator,
+        &src_bucket,
+        multi_part_key,
+        &[6_500_000, 6_700_000, 6_900_000],
+        test_name,
+    )
+    .await?;
+
+    verify_pre_migration_versions(
+        &bucket_manager,
+        &src_bucket,
+        &[
+            (single_part_key, &single_part_versions),
+            (multi_part_key, &multi_part_versions),
+        ],
+        test_name,
+    )
+    .await?;
+
+    let (first_run, second_run) =
+        run_basic_migration(&config, &src_bucket, &dst_bucket, 5, num_cpus::get()).await?;
+
+    if !first_run.success() {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "First migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "Second migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second migration run should sync 0 files (idempotency check)"
+    );
+
+    let verification_source_client = S3TestClient::new_source(config.clone()).await?;
+    let verification_dest_client = S3TestClient::new_destination(config.clone()).await?;
+
+    let single_part_source_order =
+        list_version_ids_for_object(&verification_source_client, &src_bucket, single_part_key)
+            .await?;
+    let single_part_dest_order =
+        list_version_ids_for_object(&verification_dest_client, &dst_bucket, single_part_key)
+            .await?;
+
+    if single_part_source_order != single_part_dest_order {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "Version ordering mismatch for {}. source={:?}, destination={:?}",
+            single_part_key, single_part_source_order, single_part_dest_order
+        )
+        .into());
+    }
+
+    let multi_part_source_order =
+        list_version_ids_for_object(&verification_source_client, &src_bucket, multi_part_key)
+            .await?;
+    let multi_part_dest_order =
+        list_version_ids_for_object(&verification_dest_client, &dst_bucket, multi_part_key).await?;
+
+    if multi_part_source_order != multi_part_dest_order {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "Version ordering mismatch for {}. source={:?}, destination={:?}",
+            multi_part_key, multi_part_source_order, multi_part_dest_order
+        )
+        .into());
+    }
+
+    bucket_manager.cleanup().await?;
+    file_generator.cleanup()?;
+
+    Ok(())
+}
+
 /// Complex versioned object migration test with diverse object types and sizes
 ///
 /// **Test Setup:**
@@ -474,6 +598,57 @@ async fn create_versioned_object(
     Ok(version_ids)
 }
 
+/// Create deterministic versions with predictable content ordering
+async fn create_ordered_versions(
+    bucket_manager: &TestBucketManager,
+    file_generator: &FileGenerator,
+    bucket_name: &str,
+    object_key: &str,
+    minimum_sizes: &[usize],
+    test_name: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    println!(
+        "[{}] Creating {} deterministic versions for {}",
+        test_name,
+        minimum_sizes.len(),
+        object_key
+    );
+
+    let mut version_ids = Vec::new();
+
+    for (index, minimum_size) in minimum_sizes.iter().enumerate() {
+        let header = format!("Version {} payload for {}", index + 1, object_key);
+        let mut content = header.into_bytes();
+        content.push(b'\n');
+
+        if *minimum_size > content.len() {
+            content.extend(std::iter::repeat(b'#').take(*minimum_size - content.len()));
+        }
+
+        let file_name = format!("{}-ordered-v{}", object_key, index + 1);
+        let test_file = TestFile::new(&file_name, content.len());
+        let file_path = file_generator.generate_file_with_content(&test_file, &content)?;
+
+        let version_id = bucket_manager
+            .source_client()
+            .upload_test_file_versioned(bucket_name, object_key, &file_path)
+            .await?;
+
+        println!(
+            "[{}] Created deterministic version {} for {} (size: {} bytes, version_id={})",
+            test_name,
+            index + 1,
+            object_key,
+            content.len(),
+            version_id
+        );
+
+        version_ids.push(version_id);
+    }
+
+    Ok(version_ids)
+}
+
 /// Create a complex versioned object with random number of versions (0-10) - clean objects with no metadata
 async fn create_complex_versioned_object(
     bucket_manager: &TestBucketManager,
@@ -638,6 +813,29 @@ async fn verify_pre_migration_versions(
     }
 
     Ok(())
+}
+
+async fn list_version_ids_for_object(
+    client: &S3TestClient,
+    bucket: &str,
+    object_key: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let versions = client
+        .list_object_versions(bucket, Some(object_key))
+        .await?;
+
+    let ordered_ids = versions
+        .iter()
+        .filter_map(|version| {
+            if version.key().map_or(false, |key| key == object_key) {
+                version.version_id().map(|id| id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok(ordered_ids)
 }
 
 /// Verify complex versions exist in source bucket before migration

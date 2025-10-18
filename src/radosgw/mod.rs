@@ -1,6 +1,6 @@
 pub mod uploader;
 
-use std::{fmt::Debug, pin::Pin};
+use std::{fmt::Debug, pin::Pin, str::FromStr};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -34,8 +34,11 @@ use aws_sdk_s3::{
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_types_convert::date_time::DateTimeExt;
 use bytes::Bytes;
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures::Stream;
+use http::{uri::PathAndQuery, Uri as HttpUri};
 use tracing::{debug, error, event, instrument, Level};
+use urlencoding::encode;
 
 use crate::provider::{
     Provider, ProviderObject, ProviderObjectMetadata, ProviderResponse, ProviderResponseStream,
@@ -397,6 +400,84 @@ impl RadosGW {
     }
 
     #[instrument(skip(self), level = "debug")]
+    pub async fn create_delete_marker(
+        &self,
+        key: &str,
+        version_id: &str,
+        last_modified: Option<&DateTime<Utc>>,
+    ) -> anyhow::Result<()> {
+        let bucket = self
+            .bucket
+            .clone()
+            .expect("create_delete_marker should have a bucket");
+
+        let version_param = encode(version_id).into_owned();
+        let last_modified_encoded = last_modified.map(|timestamp| {
+            let formatted = timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
+            encode(&formatted).into_owned()
+        });
+
+        let mut operation = self
+            .client
+            .delete_object()
+            .bucket(bucket)
+            .key(key.to_string())
+            .customize();
+
+        operation = operation.mutate_request(move |req| {
+            let original_http_uri: HttpUri = req
+                .uri()
+                .parse()
+                .expect("Existing request URI should be valid");
+
+            let mut parts = original_http_uri.into_parts();
+            let path = parts
+                .path_and_query
+                .as_ref()
+                .map(|pq| pq.path())
+                .unwrap_or("/");
+
+            let mut query_string = parts
+                .path_and_query
+                .as_ref()
+                .and_then(|pq| pq.query())
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+
+            if !query_string.is_empty() {
+                query_string.push('&');
+            }
+
+            query_string.push_str("x-cc-delete-version-id=");
+            query_string.push_str(&version_param);
+
+            if let Some(encoded_last_modified) = last_modified_encoded.as_ref() {
+                query_string.push('&');
+                query_string.push_str("x-cc-delete-last-modified=");
+                query_string.push_str(encoded_last_modified);
+            }
+
+            let new_path_and_query = if query_string.is_empty() {
+                PathAndQuery::from_str(path).expect("Valid path for delete marker request")
+            } else {
+                PathAndQuery::from_str(&format!("{}?{}", path, query_string))
+                    .expect("Valid path/query for delete marker request")
+            };
+
+            parts.path_and_query = Some(new_path_and_query);
+
+            let updated_http_uri = HttpUri::from_parts(parts)
+                .expect("Constructed URI for delete marker should be valid");
+
+            req.set_uri(updated_http_uri)
+                .expect("Failed to set custom delete marker URI");
+        });
+
+        operation.send().await.map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), level = "debug")]
     pub async fn list_buckets(&self) -> anyhow::Result<Vec<Bucket>> {
         self.client
             .list_buckets()
@@ -473,16 +554,21 @@ impl RadosGW {
         &self,
         object: &ProviderObject,
     ) -> Result<GetObjectAclOutput, SdkError<GetObjectAclError, HttpResponse>> {
-        self.client
+        let mut request = self
+            .client
             .get_object_acl()
             .bucket(
                 self.bucket
                     .clone()
                     .expect("get_object_acl should have a bucket"),
             )
-            .key(object.get_key())
-            .send()
-            .await
+            .key(object.get_key());
+
+        if let Some(version_id) = object.version_id() {
+            request = request.version_id(version_id.to_string());
+        }
+
+        request.send().await
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -734,11 +820,28 @@ impl Provider for RadosGW {
 
                 match output {
                     Ok(output) => {
-                        let objects: Vec<ProviderObject> = output
+                        let mut objects: Vec<ProviderObject> = output
                             .versions()
                             .iter()
                             .map(ProviderObject::from_version_record)
                             .collect();
+
+                        let delete_markers: Vec<ProviderObject> = output
+                            .delete_markers()
+                            .iter()
+                            .map(ProviderObject::from_delete_marker_record)
+                            .collect();
+
+                        if !delete_markers.is_empty() {
+                            event!(
+                                Level::DEBUG,
+                                "Listing object versions (bucket={:?}): fetched delete_markers={}",
+                                self.bucket,
+                                delete_markers.len()
+                            );
+                        }
+
+                        objects.extend(delete_markers);
 
                         event!(
                             Level::DEBUG,

@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use anyhow::anyhow;
 use aws_sdk_s3::primitives::ByteStream;
 use tokio::task::JoinError;
 use tracing::event;
@@ -263,6 +264,10 @@ impl Uploader {
         thread_id: usize,
         multipart_chunk_size: usize,
     ) -> anyhow::Result<()> {
+        if object.is_delete_marker() {
+            return Uploader::sync_delete_marker(radosgw_client, object, thread_id).await;
+        }
+
         let (mut object_metadata, mut response) = if let Some(_version_id) = object.version_id() {
             // Check if metadata was already captured during collection
             let metadata = if let Some(cached_metadata) = object.version_metadata() {
@@ -345,6 +350,32 @@ impl Uploader {
                 object: object.clone(),
             }))
         }
+    }
+
+    async fn sync_delete_marker(
+        radosgw_client: &RadosGW,
+        object: &ProviderObject,
+        thread_id: usize,
+    ) -> anyhow::Result<()> {
+        let version_id = object.version_id().ok_or_else(|| {
+            anyhow!(
+                "Delete marker is missing a version id for {}",
+                object.get_key()
+            )
+        })?;
+        let last_modified = object.get_last_modified();
+
+        event!(
+            Level::INFO,
+            "Thread {} | Creating delete marker for {} (version {})",
+            thread_id,
+            object.get_key(),
+            version_id
+        );
+
+        radosgw_client
+            .create_delete_marker(object.key(), version_id, Some(last_modified))
+            .await
     }
 
     pub async fn sync_object_singlepart(

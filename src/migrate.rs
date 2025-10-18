@@ -168,12 +168,7 @@ async fn collect_bucket_objects(
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        for object in chunk
-            .into_iter()
-            .filter(|object| !object.is_delete_marker())
-        {
-            objects.push(object);
-        }
+        objects.extend(chunk);
     }
 
     objects.sort_by(|left, right| {
@@ -198,6 +193,10 @@ async fn collect_bucket_objects(
     if use_versions && capture_version_metadata {
         #[allow(clippy::needless_range_loop)]
         for idx in 0..objects.len() {
+            if objects[idx].is_delete_marker() {
+                continue;
+            }
+
             if let Some(dest_version) = objects[idx].version_id() {
                 let metadata = provider.get_object_version_metadata(&objects[idx]).await?;
                 let updated = objects[idx]

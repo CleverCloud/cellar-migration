@@ -6,6 +6,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::DeleteMarkerEntry;
 use aws_sdk_s3::{Client, Config};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use base64::Engine;
@@ -551,14 +552,15 @@ impl S3TestClient {
         &self,
         bucket_name: &str,
         key: &str,
+        version_id: Option<&str>,
     ) -> Result<GetObjectAclOutput, Box<dyn std::error::Error>> {
-        let response = self
-            .client
-            .get_object_acl()
-            .bucket(bucket_name)
-            .key(key)
-            .send()
-            .await?;
+        let mut request = self.client.get_object_acl().bucket(bucket_name).key(key);
+
+        if let Some(version_id) = version_id {
+            request = request.version_id(version_id.to_string());
+        }
+
+        let response = request.send().await?;
 
         Ok(response)
     }
@@ -799,6 +801,51 @@ impl S3TestClient {
         Ok(versions)
     }
 
+    /// List all delete markers of objects in a bucket
+    pub async fn list_delete_markers(
+        &self,
+        bucket_name: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<DeleteMarkerEntry>, Box<dyn std::error::Error>> {
+        let mut markers = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+
+        loop {
+            let mut list_request = self
+                .client
+                .list_object_versions()
+                .bucket(bucket_name)
+                .max_keys(1000);
+
+            if let Some(prefix) = prefix {
+                list_request = list_request.prefix(prefix);
+            }
+
+            if let Some(key_marker) = &key_marker {
+                list_request = list_request.key_marker(key_marker);
+            }
+
+            if let Some(version_id_marker) = &version_id_marker {
+                list_request = list_request.version_id_marker(version_id_marker);
+            }
+
+            let response = list_request.send().await?;
+
+            markers.extend(response.delete_markers().iter().cloned());
+
+            let is_truncated = response.is_truncated().unwrap_or(false);
+            if !is_truncated {
+                break;
+            }
+
+            key_marker = response.next_key_marker().map(|s| s.to_string());
+            version_id_marker = response.next_version_id_marker().map(|s| s.to_string());
+        }
+
+        Ok(markers)
+    }
+
     /// Get object content for a specific version
     pub async fn get_object_version(
         &self,
@@ -837,6 +884,28 @@ impl S3TestClient {
             .await?;
 
         Ok(response)
+    }
+
+    /// Delete an object and return the version ID created by the delete marker
+    pub async fn delete_object(
+        &self,
+        bucket_name: &str,
+        key: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .delete_object()
+            .bucket(bucket_name)
+            .key(key)
+            .send()
+            .await?;
+
+        let version_id = response
+            .version_id()
+            .ok_or_else(|| format!("No version ID returned for delete of {}", key))?
+            .to_string();
+
+        Ok(version_id)
     }
 
     /// Upload a test file to S3 with no metadata, returning the version ID

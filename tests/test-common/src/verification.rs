@@ -89,10 +89,10 @@ impl MigrationVerifier {
 
         // Verify ACL state matches expectations (e.g., public read)
         let src_acl = source_client
-            .get_object_acl(src_bucket, &test_file.key())
+            .get_object_acl(src_bucket, &test_file.key(), None)
             .await?;
         let dst_acl = dest_client
-            .get_object_acl(dst_bucket, &test_file.key())
+            .get_object_acl(dst_bucket, &test_file.key(), None)
             .await?;
 
         let expected_public = test_file.acl_public;

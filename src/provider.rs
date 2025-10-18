@@ -162,6 +162,36 @@ impl ProviderObject {
             },
         }
     }
+
+    pub fn from_delete_marker_record(value: &aws_sdk_s3::types::DeleteMarkerEntry) -> Self {
+        let key = value
+            .key()
+            .expect("Delete marker entry key shouldn't be null")
+            .to_string();
+        let last_modified = value
+            .last_modified()
+            .map(|ts| {
+                ts.to_chrono_utc().unwrap_or_else(|error| {
+                    panic!(
+                        "Should be able to transform delete marker datetime {:?} to chrono datetime: {:?}",
+                        ts, error
+                    )
+                })
+            })
+            .expect("Delete marker should have last_modified timestamp");
+        let version_id = value
+            .version_id()
+            .expect("Delete marker should have version_id")
+            .to_string();
+
+        ProviderObject {
+            key,
+            last_modified,
+            etag: String::new(),
+            size: 0,
+            version: ProviderVersionKind::DeleteMarker { id: version_id },
+        }
+    }
 }
 
 impl From<&aws_sdk_s3::types::Object> for ProviderObject {
@@ -200,7 +230,9 @@ impl PartialEq<ProviderObject> for ProviderObject {
             (
                 ProviderVersionKind::DeleteMarker { id: left_id },
                 ProviderVersionKind::DeleteMarker { id: right_id },
-            ) if left_id == right_id => {}
+            ) if left_id == right_id => {
+                return self.key == other.key && self.last_modified == other.last_modified;
+            }
             _ => {
                 return false;
             }

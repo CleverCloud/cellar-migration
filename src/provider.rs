@@ -243,10 +243,10 @@ impl PartialEq<ProviderObject> for ProviderObject {
                 true
             } else if self.get_etag().contains('-') {
                 event!(Level::WARN, "Object {} has been uploaded using multipart upload. Falling back to last modification date to compare objects.", self.get_key());
-                self.last_modified < other.last_modified
+                self.last_modified <= other.last_modified
             } else if other.etag.contains('-') {
                 event!(Level::WARN, "Object {} has been uploaded without multipart on source bucket but with multipart on destination bucket. Falling back to last modification date to compare objects.", self.get_key());
-                self.last_modified < other.last_modified
+                self.last_modified <= other.last_modified
             } else {
                 false
             }

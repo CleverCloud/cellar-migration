@@ -33,12 +33,12 @@ impl MigrationResult {
 
     fn extract_sync_count(output: &str) -> Option<usize> {
         // Look for patterns like:
-        // "Current sync status: 5 objects to sync for a total size of..."
-        // "Current sync status: 0 synced objects for a total size of..."
+        // "2025-10-22T15:23:19.010946Z  INFO cellar_migration: Current sync status: 5 objects to sync for a total size of..."
+        // "2025-10-22T15:23:19.010946Z  INFO cellar_migration: Current sync status: 0 synced objects for a total size of..."
         // "| No files to synchronize" (when 0 files need syncing)
         for line in output.lines() {
             if line.contains("sync status:") {
-                if let Some(count_str) = line.split_whitespace().nth(3) {
+                if let Some(count_str) = line.split_whitespace().nth(7) {
                     if let Ok(count) = count_str.parse::<usize>() {
                         return Some(count);
                     }

@@ -314,6 +314,22 @@ impl Uploader {
             }
         }
 
+        if preserve_last_modified_timestamps {
+            use chrono::SecondsFormat;
+            let creation_date = object
+                .get_last_modified()
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            event!(
+                Level::DEBUG,
+                "Thread {} | Setting cc-creation-date metadata to: {}",
+                thread_id,
+                creation_date
+            );
+            object_metadata
+                .user_metadata
+                .insert("cc-creation-date".to_string(), creation_date);
+        }
+
         if response.success() {
             let start = std::time::Instant::now();
             let object_size = object.get_size() as usize;

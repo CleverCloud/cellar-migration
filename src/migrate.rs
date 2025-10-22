@@ -602,14 +602,17 @@ pub async fn create_destination_buckets(
         destination_secret_key.clone(),
         None,
     );
+    let radosgw_buckets = client.list_buckets().await?;
     let missing_buckets = {
-        let radosgw_buckets = client.list_buckets().await?;
-
         buckets
             .iter()
             .filter(|source_bucket| {
-                let source_bucket_name =
-                    format!("{}{}", destination_bucket_prefix, **source_bucket);
+                // Compute the actual destination bucket name
+                let actual_destination_bucket = if let Some(dest_bucket) = &destination_bucket {
+                    format!("{}{}", destination_bucket_prefix, dest_bucket)
+                } else {
+                    format!("{}{}", destination_bucket_prefix, **source_bucket)
+                };
 
                 !radosgw_buckets.iter().any(|radosgw_bucket| -> bool {
                     let radosgw_bucket_name = radosgw_bucket
@@ -617,7 +620,7 @@ pub async fn create_destination_buckets(
                         .as_ref()
                         .expect("RadosGW bucket should have a name");
 
-                    source_bucket_name == *radosgw_bucket_name
+                    actual_destination_bucket == *radosgw_bucket_name
                 })
             })
             .collect::<Vec<&String>>()
@@ -667,7 +670,7 @@ pub async fn create_destination_buckets(
             event!(
                 Level::INFO,
                 "Bucket {} | Bucket is missing on the destination add-on. I will try to create it",
-                bucket
+                destination_bucket
             );
 
             match client.create_bucket(destination_bucket.clone()).await {

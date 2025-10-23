@@ -554,6 +554,255 @@ async fn test_delete_markers_preserved() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Ensure multiple delete markers are preserved during migration
+///
+/// This test creates a complex version history with multiple delete markers:
+/// 1. Upload initial versions
+/// 2. Delete object (first delete marker)
+/// 3. Upload new versions (object becomes "undeleted")
+/// 4. Delete object again (second delete marker)
+/// 5. Verify all versions and delete markers are migrated
+#[test]
+async fn test_multiple_delete_markers_preserved() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(e) = TestConfig::validate_env() {
+        return Err(format!(
+            "Environment validation failed: {}. Please set the required environment variables.",
+            e
+        )
+        .into());
+    }
+
+    let config = TestConfig::from_env()?;
+    let test_name = "multiple-delete-markers";
+    let file_generator = FileGenerator::new_for_test(test_name)?;
+
+    let mut bucket_manager = TestBucketManager::new(config.clone()).await?;
+    let (src_bucket, dst_bucket) = bucket_manager
+        .create_versioned_test_buckets(test_name)
+        .await?;
+
+    let object_key = "multi-delete-object.txt";
+
+    // Phase 1: Create initial versions (50KB, 60KB, 70KB)
+    println!("[{}] Phase 1: Creating initial versions", test_name);
+    let initial_versions = create_ordered_versions(
+        &bucket_manager,
+        &file_generator,
+        &src_bucket,
+        object_key,
+        &[50_000, 60_000, 70_000],
+        test_name,
+    )
+    .await?;
+
+    // Phase 2: Delete the object (first delete marker)
+    println!("[{}] Phase 2: Creating first delete marker", test_name);
+    let first_delete_marker_id = bucket_manager
+        .source_client()
+        .delete_object(&src_bucket, object_key)
+        .await?;
+
+    println!(
+        "[{}] Created first delete marker: version_id={}",
+        test_name, first_delete_marker_id
+    );
+
+    let first_marker_metadata = get_delete_marker_metadata(
+        bucket_manager.source_client(),
+        &src_bucket,
+        object_key,
+        &first_delete_marker_id,
+    )
+    .await?;
+
+    // Phase 3: Upload new versions (80KB, 90KB) - object becomes "undeleted"
+    println!(
+        "[{}] Phase 3: Creating new versions (object becomes undeleted)",
+        test_name
+    );
+    let new_versions = create_ordered_versions(
+        &bucket_manager,
+        &file_generator,
+        &src_bucket,
+        object_key,
+        &[80_000, 90_000],
+        test_name,
+    )
+    .await?;
+
+    // Phase 4: Delete the object again (second delete marker)
+    println!("[{}] Phase 4: Creating second delete marker", test_name);
+    let second_delete_marker_id = bucket_manager
+        .source_client()
+        .delete_object(&src_bucket, object_key)
+        .await?;
+
+    println!(
+        "[{}] Created second delete marker: version_id={}",
+        test_name, second_delete_marker_id
+    );
+
+    let second_marker_metadata = get_delete_marker_metadata(
+        bucket_manager.source_client(),
+        &src_bucket,
+        object_key,
+        &second_delete_marker_id,
+    )
+    .await?;
+
+    // Verify pre-migration state
+    println!("[{}] Verifying pre-migration state", test_name);
+    let all_versions = [initial_versions, new_versions].concat();
+    verify_pre_migration_versions(
+        &bucket_manager,
+        &src_bucket,
+        &[(object_key, &all_versions)],
+        test_name,
+    )
+    .await?;
+
+    // Verify both delete markers exist in source
+    let source_markers =
+        list_delete_markers_for_object(bucket_manager.source_client(), &src_bucket, object_key)
+            .await?;
+
+    if source_markers.len() != 2 {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "Expected 2 delete markers in source, found {}",
+            source_markers.len()
+        )
+        .into());
+    }
+
+    // Run migration
+    println!("[{}] Running migration", test_name);
+    let (first_run, second_run) = run_basic_migration_with_flags(
+        &config,
+        &src_bucket,
+        &dst_bucket,
+        5,
+        num_cpus::get(),
+        true,
+        true,
+    )
+    .await?;
+
+    if !first_run.success() {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "First migration run failed with exit code: {}",
+            first_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    if !second_run.success() {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "Second migration run failed with exit code: {}",
+            second_run.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    assert_eq!(
+        second_run.files_to_sync,
+        Some(0),
+        "Second migration run should sync 0 files (idempotency check)"
+    );
+
+    // Verify post-migration state
+    println!("[{}] Verifying post-migration state", test_name);
+    let verification_source_client = S3TestClient::new_source(config.clone()).await?;
+    let verification_dest_client = S3TestClient::new_destination(config.clone()).await?;
+
+    // Verify all regular versions migrated
+    let src_versions =
+        list_version_ids_for_object(&verification_source_client, &src_bucket, object_key).await?;
+    let dst_versions =
+        list_version_ids_for_object(&verification_dest_client, &dst_bucket, object_key).await?;
+
+    if src_versions != dst_versions {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "Version mismatch for {}. source={:?}, destination={:?}",
+            object_key, src_versions, dst_versions
+        )
+        .into());
+    }
+
+    // Verify both delete markers migrated
+    let dest_markers =
+        list_delete_markers_for_object(&verification_dest_client, &dst_bucket, object_key).await?;
+
+    if dest_markers.len() != 2 {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "Expected 2 delete markers in destination, found {}",
+            dest_markers.len()
+        )
+        .into());
+    }
+
+    // Verify first delete marker
+    verify_delete_marker_migrated(
+        &verification_source_client,
+        &verification_dest_client,
+        &src_bucket,
+        &dst_bucket,
+        object_key,
+        &first_marker_metadata,
+        test_name,
+    )
+    .await?;
+
+    // Verify second delete marker
+    verify_delete_marker_migrated(
+        &verification_source_client,
+        &verification_dest_client,
+        &src_bucket,
+        &dst_bucket,
+        object_key,
+        &second_marker_metadata,
+        test_name,
+    )
+    .await?;
+
+    // Verify object is not visible in listing (because latest version is a delete marker)
+    let dest_objects = verification_dest_client
+        .list_all_objects(&dst_bucket)
+        .await?;
+
+    if dest_objects
+        .iter()
+        .any(|object| object.key.as_deref() == Some(object_key))
+    {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "Object {} unexpectedly visible in destination bucket listing",
+            object_key
+        )
+        .into());
+    }
+
+    println!(
+        "[{}] ✓ Successfully verified multiple delete markers migration",
+        test_name
+    );
+
+    bucket_manager.cleanup().await?;
+    file_generator.cleanup()?;
+
+    Ok(())
+}
+
 /// Ensure ACL state is preserved per version during migration
 #[test]
 async fn test_versioned_acl_preserved() -> Result<(), Box<dyn std::error::Error>> {
@@ -1373,6 +1622,85 @@ async fn list_delete_markers_for_object(
     }
 
     Ok(details)
+}
+
+/// Get delete marker metadata for a specific version ID
+async fn get_delete_marker_metadata(
+    client: &S3TestClient,
+    bucket: &str,
+    object_key: &str,
+    version_id: &str,
+) -> Result<DeleteMarkerMetadata, Box<dyn std::error::Error>> {
+    let markers = list_delete_markers_for_object(client, bucket, object_key).await?;
+
+    markers
+        .into_iter()
+        .find(|marker| marker.version_id == version_id)
+        .ok_or_else(|| {
+            format!(
+                "Delete marker {} not found for object {}",
+                version_id, object_key
+            )
+            .into()
+        })
+}
+
+/// Verify that a delete marker was migrated correctly
+async fn verify_delete_marker_migrated(
+    source_client: &S3TestClient,
+    dest_client: &S3TestClient,
+    src_bucket: &str,
+    dst_bucket: &str,
+    object_key: &str,
+    expected_marker: &DeleteMarkerMetadata,
+    test_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_markers =
+        list_delete_markers_for_object(source_client, src_bucket, object_key).await?;
+    let dest_markers = list_delete_markers_for_object(dest_client, dst_bucket, object_key).await?;
+
+    let source_marker = source_markers
+        .iter()
+        .find(|marker| marker.version_id == expected_marker.version_id)
+        .cloned();
+    let dest_marker = dest_markers
+        .iter()
+        .find(|marker| marker.version_id == expected_marker.version_id)
+        .cloned();
+
+    match (source_marker, dest_marker) {
+        (Some(src), Some(dst))
+            if timestamps_match(&src.last_modified, &expected_marker.last_modified)
+                && timestamps_match(&dst.last_modified, &expected_marker.last_modified) =>
+        {
+            println!(
+                "[{}] ✓ Delete marker {} verified successfully",
+                test_name, expected_marker.version_id
+            );
+            Ok(())
+        }
+        (Some(src), Some(dst)) => Err(format!(
+            "Delete marker metadata mismatch for {}. expected={{id: {}, last_modified: {}}}, source={{id: {}, last_modified: {}}}, destination={{id: {}, last_modified: {}}}",
+            object_key,
+            expected_marker.version_id,
+            format_timestamp(&expected_marker.last_modified).unwrap_or_else(|| "<none>".to_string()),
+            src.version_id,
+            format_timestamp(&src.last_modified).unwrap_or_else(|| "<none>".to_string()),
+            dst.version_id,
+            format_timestamp(&dst.last_modified).unwrap_or_else(|| "<none>".to_string())
+        )
+        .into()),
+        (Some(_), None) => Err(format!(
+            "Delete marker {} missing from destination for {}",
+            expected_marker.version_id, object_key
+        )
+        .into()),
+        (None, _) => Err(format!(
+            "Expected delete marker {} missing from source for {} after migration",
+            expected_marker.version_id, object_key
+        )
+        .into()),
+    }
 }
 
 /// Verify complex versions exist in source bucket before migration

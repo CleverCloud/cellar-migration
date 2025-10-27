@@ -954,14 +954,14 @@ async fn test_versioned_acl_preserved() -> Result<(), Box<dyn std::error::Error>
 /// **Test Setup:**
 /// - Source bucket: Versioned with 11 objects of varying sizes
 /// - Small files (5KB-100KB): 4 objects with 0-10 versions each
-/// - Medium files (2MB-10MB): 4 objects with 0-10 versions each
-/// - Large files (15MB-20MB): 3 objects with 0-10 versions each
+/// - Medium files (1MB-4MB): 4 objects with 0-10 versions each
+/// - Large files (15MB): 3 objects with 0-10 versions each, forces multipart (3 parts with 5MB chunks)
 /// - Clean objects with no custom metadata or content types
 /// - Destination bucket: Versioned, empty initially
 ///
 /// **What it tests:**
 /// - Comprehensive versioned object migration across size ranges
-/// - Mixed single-part and multi-part upload scenarios based on size
+/// - Mixed single-part (< 5MB) and multi-part (15MB = 3 parts) upload scenarios
 /// - Performance with multiple versioned objects
 /// - Version ID preservation across all objects and versions
 /// - Content preservation across versions without metadata complexity
@@ -993,12 +993,12 @@ async fn test_complex_versioned_object_migration() -> Result<(), Box<dyn std::er
 
     let mut all_objects_and_versions = Vec::new();
 
-    // Small files (1KB-100KB): 4 objects
+    // Small files (single-part, < 5MB): 4 objects
     let small_file_specs = [
-        ("config.json", 5_000),
-        ("readme.txt", 25_000),
-        ("small-data.bin", 100_000),
-        ("metadata.xml", 50_000),
+        ("config.json", 5_000),      // 5KB
+        ("readme.txt", 25_000),      // 25KB
+        ("small-data.bin", 100_000), // 100KB
+        ("metadata.xml", 50_000),    // 50KB
     ];
 
     for (object_key, size) in &small_file_specs {
@@ -1014,12 +1014,12 @@ async fn test_complex_versioned_object_migration() -> Result<(), Box<dyn std::er
         all_objects_and_versions.push((*object_key, versions));
     }
 
-    // Medium files (1MB-10MB): 4 objects
+    // Medium files (single-part, < 5MB): 4 objects
     let medium_file_specs = [
-        ("image-dataset.bin", 2_000_000),
-        ("document-archive.tar", 5_000_000),
-        ("video-sample.mp4", 8_000_000),
-        ("database-dump.sql", 10_000_000),
+        ("image-dataset.bin", 1_000_000),    // 1MB
+        ("document-archive.tar", 2_000_000), // 2MB
+        ("video-sample.mp4", 3_000_000),     // 3MB
+        ("database-dump.sql", 4_000_000),    // 4MB
     ];
 
     for (object_key, size) in &medium_file_specs {
@@ -1035,11 +1035,11 @@ async fn test_complex_versioned_object_migration() -> Result<(), Box<dyn std::er
         all_objects_and_versions.push((*object_key, versions));
     }
 
-    // Large files (multipart): 3 objects
+    // Large files (multipart with 5MB chunks = 3 parts): 3 objects
     let large_file_specs = [
-        ("large-dataset.bin", 15_000_000),
-        ("video-hd.mkv", 18_000_000),
-        ("backup-archive.zip", 20_000_000),
+        ("large-dataset.bin", 15_000_000),  // 15MB = 3 parts
+        ("video-hd.mkv", 15_000_000),       // 15MB = 3 parts
+        ("backup-archive.zip", 15_000_000), // 15MB = 3 parts
     ];
 
     for (object_key, size) in &large_file_specs {
@@ -1090,7 +1090,7 @@ async fn test_complex_versioned_object_migration() -> Result<(), Box<dyn std::er
         &config,
         &src_bucket,
         &dst_bucket,
-        10,              // 10MB chunks
+        5,               // 5MB chunks (forces multipart for 15MB files = 3 parts)
         num_cpus::get(), // Use all available CPUs
         true,
         true,

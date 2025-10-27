@@ -736,6 +736,27 @@ async fn test_multiple_delete_markers_preserved() -> Result<(), Box<dyn std::err
         .into());
     }
 
+    // Verify complete version history ordering (including delete markers)
+    let src_full_history =
+        list_full_version_history(&verification_source_client, &src_bucket, object_key).await?;
+    let dst_full_history =
+        list_full_version_history(&verification_dest_client, &dst_bucket, object_key).await?;
+
+    if src_full_history != dst_full_history {
+        bucket_manager.cleanup().await?;
+        file_generator.cleanup()?;
+        return Err(format!(
+            "Full version history ordering mismatch for {}.\nSource: {:?}\nDestination: {:?}",
+            object_key, src_full_history, dst_full_history
+        )
+        .into());
+    }
+
+    println!(
+        "[{}] ✓ Version history ordering verified: {:?}",
+        test_name, src_full_history
+    );
+
     // Verify both delete markers migrated
     let dest_markers =
         list_delete_markers_for_object(&verification_dest_client, &dst_bucket, object_key).await?;
@@ -1470,6 +1491,63 @@ async fn list_version_ids_for_object(
         .collect();
 
     Ok(ordered_ids)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VersionHistoryEntry {
+    Version(String),
+    DeleteMarker(String),
+}
+
+/// List full version history including both regular versions and delete markers in order
+async fn list_full_version_history(
+    client: &S3TestClient,
+    bucket: &str,
+    object_key: &str,
+) -> Result<Vec<VersionHistoryEntry>, Box<dyn std::error::Error>> {
+    // Get all versions and delete markers
+    let versions = client
+        .list_object_versions(bucket, Some(object_key))
+        .await?;
+    let delete_markers = client.list_delete_markers(bucket, Some(object_key)).await?;
+
+    // Combine into a single list with timestamps for sorting
+    let mut history: Vec<(VersionHistoryEntry, Option<aws_smithy_types::DateTime>)> = Vec::new();
+
+    // Add regular versions
+    for version in versions {
+        if version.key().map_or(false, |key| key == object_key) {
+            if let Some(version_id) = version.version_id() {
+                history.push((
+                    VersionHistoryEntry::Version(version_id.to_string()),
+                    version.last_modified().cloned(),
+                ));
+            }
+        }
+    }
+
+    // Add delete markers
+    for marker in delete_markers {
+        if marker.key().map_or(false, |key| key == object_key) {
+            if let Some(version_id) = marker.version_id() {
+                history.push((
+                    VersionHistoryEntry::DeleteMarker(version_id.to_string()),
+                    marker.last_modified().cloned(),
+                ));
+            }
+        }
+    }
+
+    // Sort by last_modified (newest first) to match S3's version ordering
+    history.sort_by(|a, b| match (&b.1, &a.1) {
+        (Some(ts_b), Some(ts_a)) => ts_a.cmp(ts_b),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+
+    // Extract just the entries without timestamps
+    Ok(history.into_iter().map(|(entry, _)| entry).collect())
 }
 
 async fn create_version_with_acl_state(
